@@ -6,6 +6,7 @@ def calculate_var(returns: pd.Series, confidence_level: float = 0.95) -> float:
     """
     Calculate Historical Value at Risk (VaR).
     """
+    returns = returns.dropna()
     if returns.empty:
         return 0.0
     return np.percentile(returns, 100 * (1 - confidence_level))
@@ -14,6 +15,7 @@ def calculate_cvar(returns: pd.Series, confidence_level: float = 0.95) -> float:
     """
     Calculate Conditional Value at Risk (CVaR) / Expected Shortfall.
     """
+    returns = returns.dropna()
     if returns.empty:
         return 0.0
     var = calculate_var(returns, confidence_level)

@@ -3,11 +3,22 @@ import numpy as np
 from scipy.optimize import minimize
 from typing import Dict, List, Optional
 
+from enum import Enum
+import uuid
+
+class PortfolioStatus(Enum):
+    PAUSED = "Paused"
+    LIVE = "Live"
+    ARCHIVED = "Archived"
+
 class Portfolio:
     """
-    Tracks portfolio holdings and value.
+    Tracks portfolio holdings, value, and metadata.
     """
-    def __init__(self, initial_cash: float = 100000.0):
+    def __init__(self, name: str, initial_cash: float = 100000.0, status: PortfolioStatus = PortfolioStatus.PAUSED):
+        self.id = str(uuid.uuid4())
+        self.name = name
+        self.status = status
         self.cash = initial_cash
         self.holdings: Dict[str, int] = {} # Ticker -> Quantity
         self.history: List[Dict] = []
@@ -17,15 +28,33 @@ class Portfolio:
         Buy (positive quantity) or Sell (negative quantity).
         """
         cost = quantity * price
-        if self.cash - cost < 0:
+        
+        # Check cash only on buy
+        if quantity > 0 and self.cash - cost < 0:
             raise ValueError("Insufficient cash")
         
         self.cash -= cost
         self.holdings[ticker] = self.holdings.get(ticker, 0) + quantity
         
         # Remove if 0
-        if self.holdings[ticker] == 0:
-            del self.holdings[ticker]
+        if self.holdings[ticker] <= 0:
+            # Handle sell-all or shorting (currently just removes if <= 0 for simplicity, assuming long-only)
+            # If we support shorting, invalid logic. Assuming LONG ONLY for now.
+            if self.holdings[ticker] == 0:
+                del self.holdings[ticker]
+            elif self.holdings[ticker] < 0:
+                # Revert if shorting not allowed? Or perform allow?
+                # For this MVP, let's treat it as long-only.
+                self.holdings[ticker] = 0
+                del self.holdings[ticker]
+
+    def remove_ticker(self, ticker: str, price: float):
+        """
+        Sell all shares of ticker.
+        """
+        qty = self.holdings.get(ticker, 0)
+        if qty > 0:
+            self.update_holdings(ticker, -qty, price)
 
     def get_value(self, current_prices: Dict[str, float]) -> float:
         stock_value = sum(self.holdings.get(t, 0) * p for t, p in current_prices.items())
@@ -40,6 +69,28 @@ class Portfolio:
                       for t, q in self.holdings.items()}
         allocation['CASH'] = self.cash / total_value
         return allocation
+
+class PortfolioManager:
+    """
+    Manages multiple portfolios.
+    """
+    def __init__(self):
+        self.portfolios: Dict[str, Portfolio] = {}
+        
+    def create_portfolio(self, name: str, initial_cash: float = 100000.0) -> Portfolio:
+        p = Portfolio(name, initial_cash)
+        self.portfolios[p.id] = p
+        return p
+        
+    def delete_portfolio(self, portfolio_id: str):
+        if portfolio_id in self.portfolios:
+            del self.portfolios[portfolio_id]
+            
+    def get_portfolio(self, portfolio_id: str) -> Optional[Portfolio]:
+        return self.portfolios.get(portfolio_id)
+        
+    def list_portfolios(self) -> List[Portfolio]:
+        return list(self.portfolios.values())
 
 class Optimizer:
     """

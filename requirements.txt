@@ -1,7 +1,10 @@
-yfinance
-pandas
-numpy
-scikit-learn
+plotly>=5.18.0
+yfinance>=0.2.36
+prophet>=1.1.5
+requests
+python-dotenv
+textblob
+pytrends
 streamlit
 plotly
 prophet

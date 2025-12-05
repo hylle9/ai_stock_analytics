@@ -30,19 +30,23 @@ A novel metric designed to detect "meme stock" like activity or retail frenzies.
 - **Goal**: To flag when price moves are being driven by retail flows rather than fundamental repricing.
 - *Note: Currently implemented as a heuristic proxy in `src/analytics/microstructure.py`.*
 
-### 3. AI-Powered Forecasting
-Integrated time-series forecasting using **Facebook Prophet**:
-- Decomposes price action into trends, weekly seasonality, and yearly seasonality.
-- Provides **1-Day** and **5-Day** return forecasts with confidence intervals.
-- Visualizes "uncertainty cones" to help users gaze risk.
+### 3. Multi-Portfolio Management
+Create and manage multiple distinct portfolios (e.g., "Safe Growth" vs "High Risk").
+- **States**: Portfolios can be set to **Live**, **Paused**, or **Archived**.
+- **Robo-Advisor Integration**: Each active portfolio can receive tailored allocation recommendations.
+- **Persistence**: Session-based storage allows for rapid prototyping and testing of different strategies.
 
-### 4. Interactive Dashboard
-Built with **Streamlit** and **Plotly**, the UI offers:
-- **Universe View**: A high-level heatmap and ranking table to spot top movers and RPS outliers.
-- **Stock Detail View**: Deep-dive analysis for individual tickers, featuring:
-  - Interactive candlestick charts with forecast overlays.
-  - Dual-axis charts comparing Price vs. Retail Participation.
-  - Tabbed views for Technicals, Behavioral Analysis, and News.
+### 4. Advanced Risk Dashboard
+Analyze not just the market, but your specific exposures.
+- **Source Selection**: Toggle between analyzing the entire **Universe** or a specific **Portfolio**.
+- **Metrics**: Real-time calculation of **Value at Risk (VaR)**, **Conditional VaR (Expected Shortfall)**, and Annualized Volatility.
+- **Visuals**: Scatter plots (Risk vs Volatility) to identify outliers.
+
+### 5. Resilient Data Architecture
+A robust "provider" pattern ensures the app never breaks due to missing API keys.
+- **Primary**: Alpha Vantage (for institutional-grade data).
+- **Fallback**: Yahoo Finance (yfinance) automatically takes over if API keys are missing.
+- **Smart Caching**: Local parquet caching prevents rate-limiting and speeds up repeated analysis.
 
 ---
 
@@ -51,31 +55,29 @@ Built with **Streamlit** and **Plotly**, the UI offers:
 The project follows a modular, domain-driven structure to ensure scalability and separation of concerns.
 
 ```text
-ai_stock_analyics/
+ai_stock_analytics/
 ├── main.py                 # Application Entry Point
 ├── data/                   # Local storage for cached market data (Parquet)
 ├── src/
 │   ├── analytics/          # Core Logic & Math
+│   │   ├── risk.py         # VaR, CVaR, & Volatility Metrics
 │   │   ├── fusion.py       # Pressure Score calculation
-│   │   ├── microstructure.py # RPS & Liquidity metrics
-│   │   ├── technical.py    # TA Lib wrappers (RSI, MACD, BB)
-│   │   ├── risk.py         # Volatility & Risk sizing
-│   │   └── sentiment.py    # NLP & Sentiment analysis stub
+│   │   └── technical.py    # TA indicators
 │   ├── data/               # Data Layer
-│   │   ├── ingestion.py    # DataFetcher class (yfinance, caching)
+│   │   ├── providers.py    # Data Provider Strategy Pattern (AlphaVantage/YFinance)
+│   │   ├── ingestion.py    # DataFetcher & Caching
 │   │   └── universe.py     # Ticker universe definitions
-│   ├── features/           # Feature Engineering (Legacy/Transition)
-│   ├── models/             # AI/ML Models
-│   │   └── forecaster.py   # Prophet Forecasting Logic
+│   ├── models/             # Domain Models
+│   │   ├── portfolio.py    # Portfolio & PortfolioManager Logic
+│   │   └── decision.py     # Robo-Advisor Recommender
 │   └── ui/                 # Presentation Layer
 │       ├── app.py          # Streamlit Main Layout
-│       ├── dashboard.py    # Landing Page / Market Overview
-│       └── stock_view.py   # Detailed Ticker Analysis View
+│       ├── views/          # Modular UI Views
+│       │   ├── portfolio_view.py
+│       │   ├── risk_view.py
+│       │   └── stock_view.py
+└── tests/                  # Unit & Integration Tests
 ```
-
-### Key Components
-- **`src/data/ingestion.py`**: Smart caching layer. It fetches data from `yfinance`, saves it to `data/raw/*.parquet`, and reloads from disk if the data is less than 24 hours old. This significantly speeds up development and reduces API rate limits.
-- **`src/analytics/fusion.py`**: Contains the proprietary logic for weighting and normalizing the multi-modal signals.
 
 ---
 
@@ -89,7 +91,7 @@ ai_stock_analyics/
 
 1. **Clone the Repository**
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/hylle9/ai_stock_analytics.git
    cd ai_stock_analytics
    ```
 
@@ -109,43 +111,36 @@ ai_stock_analyics/
    ```bash
    python main.py
    ```
-   *Alternatively, you can run directly with streamlit:*
-   ```bash
-   streamlit run src/ui/app.py
-   ```
+   *The app will launch at http://localhost:8501*
 
 ---
 
 ## 📖 Usage Guide
 
-### 1. Market Overview
-Upon launching, you will see the **Market Overview**.
-- **Top Retail Movers**: A table showing stocks with the highest "RPS" (Retail Participation Score). Use this to find stocks that are currently "in play."
-- **Progress Bar**: Indicates the loading status of the analysis pipeline.
+### 1. Market & Risk Overview
+- Check the **Risk Dashboard** to see the volatility profile of the "Big Tech" universe.
+- Toggle top "Source" to "Portfolio" to see how your personal holdings compare.
 
-### 2. Analyzing a Stock
-1. Go to the sidebar.
-2. Enter a valid US Ticker Symbol (e.g., `AAPL`, `NVDA`, `GME`).
-3. Click **"Analyze"**.
-4. The main view will update with:
-   - **Header Metrics**: Current Price, RPS Score, Forecasted Return, and Confidence.
-   - **Tabs**:
-     - *Price & Forecast*: Visualizes the Prophet model's prediction.
-     - *Behavioral*: Shows the relationship between Volume and the RPS score.
-     - *Technical*: Standard indicators like RSI and ATR.
+### 2. Managing Portfolios
+1. Navigate to **Portfolio & Robo-Advisor**.
+2. **Create**: Open the sidebar expander to name a new portfolio.
+3. **Status**: Use the dropdown to set it to "Live" or "Paused".
+4. **Trade**: Add tickers (e.g., `NVDA`, `TSLA`) and quantities.
+5. **Analyze**: Switch back to the Risk Dashboard to see your portfolio's metrics.
+
+### 3. Detailed Analysis
+- Use **Stock Analysis** to deep-dive into specific tickers with Multi-Modal signals and Price Forecasting.
 
 ---
 
 ## 🔮 Roadmap
 
-- **Phase 2: True Multi-Modal (In Progress)**
-  - Replace synthetic sentiment with real Twitter/X & Reddit NLP analysis.
-  - Integrate live Google Trends API for real-time attention scoring.
-  - Refine Fusion Engine weights using a genetic algorithm or regression model.
+- **Phase 4: Optimization Engine**
+  - Implement full Mean-Variance Optimization (MVO) with user-selectable constraints.
+  - Integration with brokerage APIs for one-click trade execution.
 
-- **Phase 3: Portfolio & Robo-Advisor**
-  - Add "Portfolio Optimization" module using Mean-Variance Optimization (MVO).
-  - Implement "Robo-Advisor" chat interface for natural language queries (e.g., *"Why is my portfolio down today?"*).
+- **Phase 5: LLM Integration**
+  - Natural language querying of portfolio performance ("Why is my exposure to Tech so high?").
 
 ---
 

@@ -43,6 +43,11 @@ class UniverseManager:
             ))
 
     def save_universe(self, universe: Universe):
+        # Check limit (exclude updates to existing universes)
+        current_universes = self.list_universes()
+        if len(current_universes) >= 10 and universe.name not in current_universes:
+            raise ValueError("Universe limit reached (10). Please delete an existing universe first.")
+            
         file_path = os.path.join(self.storage_path, f"{universe.name}.json")
         with open(file_path, 'w') as f:
             json.dump(universe.to_dict(), f, indent=4)
@@ -55,6 +60,13 @@ class UniverseManager:
             data = json.load(f)
         return Universe.from_dict(data)
 
+    def delete_universe(self, name: str):
+        file_path = os.path.join(self.storage_path, f"{name}.json")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
     def list_universes(self) -> List[str]:
+        if not os.path.exists(self.storage_path):
+             return []
         files = [f for f in os.listdir(self.storage_path) if f.endswith(".json")]
         return sorted([f.replace(".json", "") for f in files])

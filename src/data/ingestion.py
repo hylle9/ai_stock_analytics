@@ -133,6 +133,12 @@ class DataFetcher:
             "Social_Sentiment": sentiment
         }).set_index("Date")
 
+    def search_assets(self, query: str) -> list:
+        """
+        Search for assets matching a query.
+        """
+        return self.provider.search_assets(query)
+
 if __name__ == "__main__":
     fetcher = DataFetcher()
     # Note: Requires API KEY in .env

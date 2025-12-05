@@ -33,9 +33,10 @@ class BaseDataProvider(ABC):
         pass
 
     @abstractmethod
-    def fetch_attention(self, ticker: str) -> float:
+    def search_assets(self, query: str) -> list:
         """
-        Fetch attention score (normalized 0-100).
+        Search for assets by name or ticker.
+        Returns: List of dicts [{'symbol', 'name', 'type', 'region', 'matchScore'}]
         """
         pass
 
@@ -74,14 +75,16 @@ class AlphaVantageProvider(BaseDataProvider):
         self.api_key = Config.ALPHA_VANTAGE_API_KEY
         if not self.api_key:
             print("Warning: No Alpha Vantage API key found.")
-
-    def _make_request(self, function: str, symbol: str, **kwargs):
+            
+    def _make_request(self, function: str, symbol: str = None, **kwargs):
         params = {
             "function": function,
-            "symbol": symbol,
             "apikey": self.api_key,
             **kwargs
         }
+        if symbol:
+            params["symbol"] = symbol
+            
         try:
             response = requests.get(self.BASE_URL, params=params)
             response.raise_for_status()
@@ -158,6 +161,21 @@ class AlphaVantageProvider(BaseDataProvider):
 
     def fetch_attention(self, ticker: str) -> float:
         return 0.0
+        
+    def search_assets(self, query: str) -> list:
+        data = self._make_request("SYMBOL_SEARCH", keywords=query)
+        matches = data.get("bestMatches", [])
+        
+        results = []
+        for match in matches:
+            results.append({
+                'symbol': match.get('1. symbol'),
+                'name': match.get('2. name'),
+                'type': match.get('3. type'),
+                'region': match.get('4. region'),
+                'matchScore': float(match.get('9. matchScore', 0.0))
+            })
+        return results
 
 class YFinanceProvider(BaseDataProvider):
     """
@@ -223,3 +241,30 @@ class YFinanceProvider(BaseDataProvider):
         
     def fetch_attention(self, ticker: str) -> float:
         return 0.0
+        
+    def search_assets(self, query: str) -> list:
+        # Check if we should use this fallback (if user has no AV key this will be active)
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        params = {"q": query, "quotesCount": 10, "newsCount": 0}
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        try:
+            resp = requests.get(url, params=params, headers=headers)
+            data = resp.json()
+            quotes = data.get("quotes", [])
+            
+            results = []
+            for q in quotes:
+                # Filter useful types
+                if q.get('quoteType') in ['EQUITY', 'ETF', 'MUTUALFUND']:
+                    results.append({
+                        'symbol': q.get('symbol'),
+                        'name': q.get('shortname') or q.get('longname'),
+                        'type': q.get('quoteType'),
+                        'region': q.get('exchange'),
+                        'matchScore': float(q.get('score', 0.0))
+                    })
+            return results
+        except Exception as e:
+            print(f"YFinance search error: {e}")
+            return []

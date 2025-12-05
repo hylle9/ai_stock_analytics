@@ -1,0 +1,10 @@
+{
+    "name": "Test Universe",
+    "tickers": [
+        "AMD",
+        "GOOGL",
+        "INTCAAPL",
+        "MSFT"
+    ],
+    "description": ""
+}

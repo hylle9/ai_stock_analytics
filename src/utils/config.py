@@ -10,6 +10,7 @@ class Config:
     """
     # API Keys
     ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     
     # Data Settings
     DATA_CACHE_DIR = os.getenv("DATA_CACHE_DIR", "data/raw")

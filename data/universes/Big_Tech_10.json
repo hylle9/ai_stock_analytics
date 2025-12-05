@@ -1,0 +1,16 @@
+{
+    "name": "Big_Tech_10",
+    "tickers": [
+        "AAPL",
+        "AMD",
+        "AMZN",
+        "GOOGL",
+        "INTC",
+        "META",
+        "MSFT",
+        "NFLX",
+        "NVDA",
+        "TSLA"
+    ],
+    "description": "Top 10 US Tech stocks"
+}

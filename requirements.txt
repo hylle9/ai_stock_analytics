@@ -10,3 +10,4 @@ plotly
 prophet
 ta
 google-generativeai
+tabulate

@@ -7,15 +7,28 @@ from src.data.universe import UniverseManager
 from src.data.ingestion import DataFetcher
 
 def initialize_portfolio_manager():
-    if 'portfolio_manager' not in st.session_state:
+    if 'portfolio_manager' not in st.session_state or not hasattr(st.session_state.portfolio_manager, 'save_portfolio'):
+        import importlib
+        import src.models.portfolio
+        importlib.reload(src.models.portfolio)
+        from src.models.portfolio import PortfolioManager, PortfolioStatus
+        
         pm = PortfolioManager()
-        # Seed a default portfolio
-        p = pm.create_portfolio("Main Portfolio", 100000)
-        p.update_holdings("AAPL", 100, 150.0)
-        p.update_holdings("MSFT", 50, 250.0)
-        p.status = PortfolioStatus.LIVE
+        
+        # Check if we have loaded portfolios, otherwise seed default
+        existing_portfolios = pm.list_portfolios()
+        if not existing_portfolios:
+            p = pm.create_portfolio("Main Portfolio", 100000)
+            p.update_holdings("AAPL", 100, 150.0)
+            p.update_holdings("MSFT", 50, 250.0)
+            p.status = PortfolioStatus.LIVE
+            pm.save_portfolio(p)
+            st.session_state.active_portfolio_id = p.id
+        else:
+            # Default to first one
+            st.session_state.active_portfolio_id = existing_portfolios[0].id
+            
         st.session_state.portfolio_manager = pm
-        st.session_state.active_portfolio_id = p.id
 
 def render_portfolio_view():
     initialize_portfolio_manager()
@@ -72,13 +85,16 @@ def render_portfolio_view():
         st.title(f"💼 {portfolio.name}")
     with c2:
         # Status Switcher
-        new_status = st.selectbox(
+        # Status Switcher
+        # Fix: Use string values to avoid Enum identity issues during reload
+        status_options = [s.value for s in PortfolioStatus]
+        new_status_val = st.selectbox(
             "Status", 
-            options=[s for s in PortfolioStatus],
-            format_func=lambda x: x.value,
-            index=list(PortfolioStatus).index(portfolio.status),
+            options=status_options,
+            index=status_options.index(portfolio.status.value),
             label_visibility="collapsed"
         )
+        new_status = PortfolioStatus(new_status_val)
         if new_status != portfolio.status:
             portfolio.status = new_status
             st.rerun()
@@ -145,6 +161,7 @@ def render_portfolio_view():
                 cc4.write(row['Value'])
                 if cc5.button("Sell All", key=f"sell_{row['Ticker']}"):
                     portfolio.remove_ticker(row['Ticker'], current_prices.get(row['Ticker'], 0))
+                    pm.save_portfolio(portfolio)
                     st.rerun()
         else:
             st.info("No holdings. Add some assets!")
@@ -167,12 +184,86 @@ def render_portfolio_view():
                     if price > 0:
                         try:
                             portfolio.update_holdings(t_input, int(q_input), price)
+                            pm.save_portfolio(portfolio)
                             st.success(f"Executed: {t_input} {q_input} @ ${price:.2f}")
                             st.rerun()
                         except ValueError as e:
                             st.error(f"Failed: {e}")
                     else:
                         st.error("Could not fetch price for ticker.")
+                        
+    # --- Opportunity Discovery ---
+    st.divider()
+    st.subheader("🔍 Opportunity Discovery")
+    
+    from src.data.relationships import RelationshipManager
+    rm = RelationshipManager()
+    
+    if portfolio.holdings:
+        # Check for unknown holdings
+        unknown_holdings = [t for t in portfolio.holdings.keys() if not rm.get_info(t)]
+        
+        if unknown_holdings:
+            st.info(f"We don't have relationship data for: {', '.join(unknown_holdings)}")
+            cols_ai = st.columns(len(unknown_holdings))
+            for i, t in enumerate(unknown_holdings):
+                with cols_ai[i]:
+                    if st.button(f"✨ Expand Knowledge: {t}", key=f"ai_exp_{t}"):
+                         with st.spinner(f"Asking Gemini about {t}..."):
+                             success = rm.expand_knowledge(t)
+                             if success:
+                                 st.success(f"Learned about {t}!")
+                                 st.rerun()
+                             else:
+                                 st.error("Failed to expand knowledge. Check API Key.")
+            st.divider()
+
+        recs = rm.get_recommendations_for_portfolio(list(portfolio.holdings.keys()))
+        
+        tab_peers, tab_comps = st.tabs(["Industry Peers", "Direct Competitors"])
+        
+        def render_rec_card(item, key_suffix):
+            with st.container():
+                col_r1, col_r2, col_r3 = st.columns([2, 2, 1])
+                with col_r1:
+                    st.markdown(f"**{item['ticker']}**")
+                    st.caption(item['name'])
+                with col_r2:
+                    st.caption(item['reason'])
+                with col_r3:
+                    if st.button("Add", key=f"add_rec_{item['ticker']}_{key_suffix}"):
+                        # Auto-add 10 shares
+                        # Determine price
+                        p_rec = current_prices.get(item['ticker'], 0)
+                        if p_rec == 0:
+                             d_rec = fetcher.fetch_ohlcv(item['ticker'], "1d")
+                             if not d_rec.empty:
+                                 p_rec = d_rec['close'].iloc[-1]
+                        
+                        if p_rec > 0:
+                            portfolio.update_holdings(item['ticker'], 10, p_rec)
+                            pm.save_portfolio(portfolio)
+                            st.toast(f"Added 10 shares of {item['ticker']}!")
+                            st.rerun()
+                        else:
+                            st.error("Price unavailable")
+                st.divider()
+        
+        with tab_peers:
+            if recs['peers']:
+                for item in recs['peers']:
+                    render_rec_card(item, "peer")
+            else:
+                st.info("No industry peers found for current holdings.")
+                
+        with tab_comps:
+            if recs['competitors']:
+                for item in recs['competitors']:
+                    render_rec_card(item, "comp")
+            else:
+                st.info("No direct competitors found for current holdings.")
+    else:
+        st.info("Add holdings to see related opportunities.")
 
     # Robo-Advisor (Only show if LIVE or PAUSED)
     if portfolio.status != PortfolioStatus.ARCHIVED:
@@ -182,6 +273,5 @@ def render_portfolio_view():
              # Basic Robo logic setup
              risk_score = st.slider("Risk Tolerance", 1, 10, 5)
              st.info(f"Robo-advisor implementation would use Risk Score: {risk_score} to optimize allocations.")
-             # (Keeping original robo logic minimized for this refactor to focus on Portfolio Management)
     else:
         st.warning("Portfolio is Archived. Robo-Advisor disabled.")

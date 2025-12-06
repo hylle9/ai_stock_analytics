@@ -1,0 +1,16 @@
+[
+    {
+        "id": "34e5f7f4-7b36-4054-950b-e7b5d7ec0bc6",
+        "name": "Main Portfolio",
+        "status": "Live",
+        "cash": 60257.80029296875,
+        "holdings": {
+            "AAPL": 100,
+            "MSFT": 50,
+            "GOOGL": 10,
+            "AMZN": 10,
+            "META": 10
+        },
+        "history": []
+    }
+]

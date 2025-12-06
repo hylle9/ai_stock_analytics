@@ -18,7 +18,7 @@ class BaseDataProvider(ABC):
         pass
 
     @abstractmethod
-    def fetch_news(self, ticker: str) -> list:
+    def fetch_news(self, ticker: str, limit: int = 50) -> list:
         """
         Fetch news items.
         Returns: List of dicts [{'title', 'publisher', 'link', 'providerPublishTime'}]
@@ -38,6 +38,12 @@ class BaseDataProvider(ABC):
         Search for assets by name or ticker.
         Returns: List of dicts [{'symbol', 'name', 'type', 'region', 'matchScore'}]
         """
+    @abstractmethod
+    def fetch_key_metrics(self, ticker: str) -> dict:
+        """
+        Fetch fundamental metrics like P/E.
+        Returns: Dict {'pe_ratio': float, 'market_cap': float, ...}
+        """
         pass
 
 class StockTwitsProvider:
@@ -53,7 +59,7 @@ class StockTwitsProvider:
         """
         try:
             url = self.BASE_URL.format(ticker)
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 messages = data.get('messages', [])
@@ -86,7 +92,7 @@ class AlphaVantageProvider(BaseDataProvider):
             params["symbol"] = symbol
             
         try:
-            response = requests.get(self.BASE_URL, params=params)
+            response = requests.get(self.BASE_URL, params=params, timeout=10)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -119,8 +125,8 @@ class AlphaVantageProvider(BaseDataProvider):
         # Defaulting to returning all fetched data for now.
         return df
 
-    def fetch_news(self, ticker: str) -> list:
-        data = self._make_request("NEWS_SENTIMENT", ticker, limit=50)
+    def fetch_news(self, ticker: str, limit: int = 50) -> list:
+        data = self._make_request("NEWS_SENTIMENT", ticker, limit=limit)
         feed = data.get("feed", [])
         
         normalized = []
@@ -162,6 +168,14 @@ class AlphaVantageProvider(BaseDataProvider):
     def fetch_attention(self, ticker: str) -> float:
         return 0.0
         
+    def fetch_key_metrics(self, ticker: str) -> dict:
+        data = self._make_request("OVERVIEW", ticker)
+        try:
+            pe = float(data.get("PERatio", 0))
+        except:
+            pe = 0.0
+        return {'pe_ratio': pe}
+
     def search_assets(self, query: str) -> list:
         data = self._make_request("SYMBOL_SEARCH", keywords=query)
         matches = data.get("bestMatches", [])
@@ -203,7 +217,7 @@ class YFinanceProvider(BaseDataProvider):
             print(f"YFinance OHLCV unexpected error: {e}")
             return pd.DataFrame()
 
-    def fetch_news(self, ticker: str) -> list:
+    def fetch_news(self, ticker: str, limit: int = 10) -> list:
         import yfinance as yf
         try:
             t = yf.Ticker(ticker)
@@ -242,6 +256,18 @@ class YFinanceProvider(BaseDataProvider):
     def fetch_attention(self, ticker: str) -> float:
         return 0.0
         
+    def fetch_key_metrics(self, ticker: str) -> dict:
+        import yfinance as yf
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+            # Try trailing, then forward
+            pe = info.get('trailingPE') or info.get('forwardPE') or 0.0
+            return {'pe_ratio': float(pe)}
+        except Exception as e:
+            print(f"YF Metrics error: {e}")
+            return {'pe_ratio': 0.0}
+
     def search_assets(self, query: str) -> list:
         # Check if we should use this fallback (if user has no AV key this will be active)
         url = "https://query2.finance.yahoo.com/v1/finance/search"
@@ -249,7 +275,7 @@ class YFinanceProvider(BaseDataProvider):
         headers = {'User-Agent': 'Mozilla/5.0'}
         
         try:
-            resp = requests.get(url, params=params, headers=headers)
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
             data = resp.json()
             quotes = data.get("quotes", [])
             

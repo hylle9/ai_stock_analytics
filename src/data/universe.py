@@ -26,6 +26,8 @@ class Universe:
             description=data.get("description", "")
         )
 
+from src.utils import defaults
+
 class UniverseManager:
     """
     Persists and retrieves Universes.
@@ -37,9 +39,9 @@ class UniverseManager:
         # Seed default universe if empty
         if not os.listdir(self.storage_path):
             self.save_universe(Universe(
-                name="Big_Tech_10", 
-                tickers=["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "NFLX", "AMD", "INTC"],
-                description="Top 10 US Tech stocks"
+                name=defaults.DEFAULT_UNIVERSE_NAME, 
+                tickers=defaults.DEFAULT_UNIVERSE_TICKERS,
+                description=defaults.DEFAULT_UNIVERSE_DESCRIPTION
             ))
 
     def save_universe(self, universe: Universe):

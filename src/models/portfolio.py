@@ -11,17 +11,42 @@ class PortfolioStatus(Enum):
     LIVE = "Live"
     ARCHIVED = "Archived"
 
+import json
+import os
+
 class Portfolio:
     """
     Tracks portfolio holdings, value, and metadata.
     """
-    def __init__(self, name: str, initial_cash: float = 100000.0, status: PortfolioStatus = PortfolioStatus.PAUSED):
-        self.id = str(uuid.uuid4())
+    def __init__(self, name: str, initial_cash: float = 100000.0, status: PortfolioStatus = PortfolioStatus.PAUSED, pid: str = None):
+        self.id = pid if pid else str(uuid.uuid4())
         self.name = name
         self.status = status
         self.cash = initial_cash
         self.holdings: Dict[str, int] = {} # Ticker -> Quantity
         self.history: List[Dict] = []
+
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status.value,
+            "cash": self.cash,
+            "holdings": self.holdings,
+            "history": self.history
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Portfolio':
+        p = cls(
+            name=data["name"],
+            initial_cash=data["cash"],
+            status=PortfolioStatus(data["status"]),
+            pid=data["id"]
+        )
+        p.holdings = data.get("holdings", {})
+        p.history = data.get("history", [])
+        return p
 
     def update_holdings(self, ticker: str, quantity: int, price: float):
         """
@@ -38,13 +63,10 @@ class Portfolio:
         
         # Remove if 0
         if self.holdings[ticker] <= 0:
-            # Handle sell-all or shorting (currently just removes if <= 0 for simplicity, assuming long-only)
-            # If we support shorting, invalid logic. Assuming LONG ONLY for now.
             if self.holdings[ticker] == 0:
                 del self.holdings[ticker]
             elif self.holdings[ticker] < 0:
-                # Revert if shorting not allowed? Or perform allow?
-                # For this MVP, let's treat it as long-only.
+                # Assuming long-only for now
                 self.holdings[ticker] = 0
                 del self.holdings[ticker]
 
@@ -72,22 +94,49 @@ class Portfolio:
 
 class PortfolioManager:
     """
-    Manages multiple portfolios.
+    Manages multiple portfolios with persistence.
     """
+    STORAGE_PATH = "data/portfolios.json"
+
     def __init__(self):
         self.portfolios: Dict[str, Portfolio] = {}
+        self.load_portfolios()
         
+    def load_portfolios(self):
+        if os.path.exists(self.STORAGE_PATH):
+            try:
+                with open(self.STORAGE_PATH, 'r') as f:
+                    data = json.load(f)
+                    for p_data in data:
+                        p = Portfolio.from_dict(p_data)
+                        self.portfolios[p.id] = p
+            except Exception as e:
+                print(f"Error loading portfolios: {e}")
+
+    def save_portfolios(self):
+        os.makedirs(os.path.dirname(self.STORAGE_PATH), exist_ok=True)
+        data = [p.to_dict() for p in self.portfolios.values()]
+        with open(self.STORAGE_PATH, 'w') as f:
+            json.dump(data, f, indent=4)
+
     def create_portfolio(self, name: str, initial_cash: float = 100000.0) -> Portfolio:
         p = Portfolio(name, initial_cash)
         self.portfolios[p.id] = p
+        self.save_portfolios()
         return p
         
     def delete_portfolio(self, portfolio_id: str):
         if portfolio_id in self.portfolios:
             del self.portfolios[portfolio_id]
+            self.save_portfolios()
             
     def get_portfolio(self, portfolio_id: str) -> Optional[Portfolio]:
         return self.portfolios.get(portfolio_id)
+        
+    def save_portfolio(self, portfolio: Portfolio):
+        """Explicit save trigger for updates"""
+        self.portfolios[portfolio.id] = portfolio
+        self.save_portfolios()
         
     def list_portfolios(self) -> List[Portfolio]:
         return list(self.portfolios.values())

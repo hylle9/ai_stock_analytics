@@ -15,7 +15,11 @@ class Config:
     # Data Settings
     DATA_CACHE_DIR = os.getenv("DATA_CACHE_DIR", "data/raw")
     USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "False").lower() == "true"
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     
+    USE_SYNTHETIC_DB = False
+    DATA_STRATEGY = "LEGACY" # "LEGACY", "SYNTHETIC", "LIVE", "PRODUCTION"
+
     # Feature Flags
     ENABLE_REAL_SENTIMENT = os.getenv("ENABLE_REAL_SENTIMENT", "True").lower() == "true"
 

@@ -174,7 +174,15 @@ class AlphaVantageProvider(BaseDataProvider):
             pe = float(data.get("PERatio", 0))
         except:
             pe = 0.0
-        return {'pe_ratio': pe}
+            
+        return {
+            'pe_ratio': pe,
+            'market_cap': float(data.get("MarketCapitalization", 0) if data.get("MarketCapitalization") and data.get("MarketCapitalization") != "None" else 0),
+            'eps': float(data.get("EPS", 0) if data.get("EPS") and data.get("EPS") != "None" else 0),
+            'sector': data.get("Sector", "Unknown"),
+            'industry': data.get("Industry", "Unknown"),
+            'name': data.get("Name", ticker)
+        }
 
     def search_assets(self, query: str) -> list:
         data = self._make_request("SYMBOL_SEARCH", keywords=query)
@@ -204,13 +212,18 @@ class YFinanceProvider(BaseDataProvider):
             
             # Helper to clean multi-index if present
             if isinstance(df.columns, pd.MultiIndex):
+                # Usually (Price, Ticker). We want just Price.
                 df.columns = df.columns.get_level_values(0)
+                # If there are duplicates (e.g. multiple tickers downloaded but we only want one), 
+                # this might be an issue, but for single ticker it's fine.
                 
             df = df.rename(columns={
                 "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
             })
             
             # Ensure columns exist and are lowercase
+            # Check for missing columns and warn/fill? 
+            # For now just proceed.
             df.columns = [c.lower() for c in df.columns]
             return df
         except Exception as e:
@@ -263,7 +276,14 @@ class YFinanceProvider(BaseDataProvider):
             info = t.info
             # Try trailing, then forward
             pe = info.get('trailingPE') or info.get('forwardPE') or 0.0
-            return {'pe_ratio': float(pe)}
+            return {
+                'pe_ratio': float(pe),
+                'market_cap': info.get('marketCap', 0),
+                'eps': info.get('trailingEps', 0),
+                'sector': info.get('sector', 'Unknown'),
+                'industry': info.get('industry', 'Unknown'),
+                'name': info.get('shortName') or info.get('longName', ticker)
+            }
         except Exception as e:
             print(f"YF Metrics error: {e}")
             return {'pe_ratio': 0.0}

@@ -15,15 +15,43 @@ from src.models.portfolio import PortfolioManager, PortfolioStatus
 
 
 # Helper for programmatic navigation
+from src.utils.config import Config
+# Parse Args for Synthetic Mode (Streamlit runs top to bottom)
+if "--synthetic" in sys.argv:
+    Config.USE_SYNTHETIC_DB = True
+    Config.DATA_STRATEGY = "SYNTHETIC"
+elif "--live" in sys.argv:
+    Config.USE_SYNTHETIC_DB = True
+    Config.DATA_STRATEGY = "LIVE"
+elif "--production" in sys.argv:
+    Config.USE_SYNTHETIC_DB = True
+    Config.DATA_STRATEGY = "PRODUCTION"
+
 def navigate_to_analysis(ticker):
     st.session_state.analysis_ticker = ticker
     st.session_state.navigation_page = "Stock Analysis"
+
+def render_sidebar():
+    with st.sidebar:
+        st.title("AI Stock Lab")
+        
+        if Config.USE_SYNTHETIC_DB:
+            if Config.DATA_STRATEGY == "PRODUCTION":
+                st.success("🟢 Production Mode (Strict Live Data)")
+            elif Config.DATA_STRATEGY == "LIVE":
+                st.success("🟢 Live DB Mode (Prioritize API)")
+            else:
+                st.success("🟢 Synthetic DB Mode (Prioritize DB)")
+        else:
+             st.error("🔴 File Cache Mode (Legacy)")
+             
+        st.write("Navigation")
 
 def main():
     st.set_page_config(page_title="AI Stock Lab", layout="wide")
     initialize_portfolio_manager()
     
-    st.sidebar.title("AI Stock Lab")
+    render_sidebar()
     
     # Ensure default
     if "navigation_page" not in st.session_state:

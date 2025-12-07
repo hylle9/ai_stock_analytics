@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from datetime import datetime
 import numpy as np
 import plotly.graph_objects as go
@@ -16,6 +17,7 @@ from src.analytics.insights import InsightManager
 from src.analytics.activity import ActivityTracker
 from src.data.relationships import RelationshipManager
 from src.utils import defaults
+from src.utils.config import Config
 
 def plot_stock_chart(df, ticker, forecast=None, benchmark_df=None):
     # Create figure with secondary y-axis
@@ -97,7 +99,7 @@ def render_stock_view():
         # Ticker Input
         c_tick, c_like = st.columns([3, 1])
         with c_tick:
-            ticker = st.text_input("Ticker Symbol", value=st.session_state.analysis_ticker).upper()
+            ticker = st.text_input("Ticker Symbol", value=st.session_state.analysis_ticker).upper().strip()
         
         with c_like:
             st.text(" ")
@@ -154,7 +156,21 @@ def render_stock_view():
         # 1. Fetch Analysis Data (Fixed 2y for stable signals)
         df_analysis = fetcher.fetch_ohlcv(ticker, period="2y")
         
+        # Fire-and-forget profile update (populates DB with Sector/Industry)
+        if Config.DATA_STRATEGY != "LEGACY":
+             fetcher.get_company_profile(ticker)
+
         if not df_analysis.empty:
+            # Production Mode Integrity Check
+            if Config.DATA_STRATEGY == "PRODUCTION":
+                 # Default to synthetic if source column missing
+                 is_syn = df_analysis['source'] != 'live' if 'source' in df_analysis.columns else pd.Series([True] * len(df_analysis), index=df_analysis.index)
+                 syn_count = is_syn.sum()
+                 
+                 if syn_count > 0:
+                     pct = (syn_count / len(df_analysis)) * 100
+                     st.warning(f"⚠️ **Production Mode**: {pct:.1f}% of loaded history is Synthetic. Metrics may be approximate.")
+
             # Add features for Analysis
             df_analysis = add_technical_features(df_analysis)
             
@@ -555,7 +571,7 @@ def render_stock_view():
                         st.divider()
 
         else:
-            st.error(f"No data found for ticker '{ticker}'.")
+            st.error(f"No data found for ticker '{ticker}'. Please ensure valid ticker, internet connection, or try again (Wait for API rate limits).")
             return
 
     # --- Opportunity Discovery (Added) ---
@@ -604,7 +620,7 @@ def render_stock_view():
                              st.success("Competitors found!")
                              st.rerun()
                          else:
-                             st.error("Failed to find competitors. Check API Key.")
+                             st.error("Failed to find competitors. Usage Limit Exceeded (Daily Quota) or Invalid API Key.")
     else:
          if ticker:
              col_miss1, col_miss2 = st.columns([3, 1])

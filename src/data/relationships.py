@@ -14,9 +14,61 @@ class RelationshipManager:
     
     SEED_PATH = "src/data/sp500_seed.json"
 
+# from src.data.db_manager import DBManager # Removed top level
+
+class RelationshipManager:
+    """
+    Manages relationship data for tickers (Sector, Industry, Competitors).
+    Supports persistence via DuckDB or JSON.
+    """
+    
+    STORAGE_PATH = "data/sp500_gemini_expand.json"
+    SEED_PATH = "src/data/sp500_seed.json"
+
     def __init__(self):
         self.database = {}
-        self._load_database()
+        
+        if Config.USE_SYNTHETIC_DB:
+            from src.data.db_manager import DBManager
+            self.db = DBManager()
+            self._sync_seed_to_db()
+        else:
+            self.db = None
+            self._load_database()
+
+    def _sync_seed_to_db(self):
+        """Syncs seed data into DuckDB if needed."""
+        if os.path.exists(self.SEED_PATH):
+            try:
+                with open(self.SEED_PATH, 'r') as f:
+                    seed_data = json.load(f)
+                
+                con = self.db.get_connection()
+                try:
+                    for t, v in seed_data.items():
+                        # Unpack
+                        name = v.get("name", t)
+                        sector = v.get("sector", "Unknown")
+                        industry = v.get("industry", "Unknown")
+                        
+                        # Upsert Asset
+                        con.execute("INSERT OR IGNORE INTO dim_assets (ticker, name, sector, industry) VALUES (?, ?, ?, ?)", 
+                                   (t, name, sector, industry))
+                                   
+                        # Competitors
+                        comps = v.get("competitors", [])
+                        for c in comps:
+                            # Verify competitor exists as asset (placeholder)
+                            con.execute("INSERT OR IGNORE INTO dim_assets (ticker, name, sector) VALUES (?, ?, ?)", 
+                                       (c, c, sector)) # Assume same sector for simplicity if unknown
+                            
+                            # Insert Link
+                            con.execute("INSERT OR IGNORE INTO dim_competitors (ticker_a, ticker_b, reason) VALUES (?, ?, ?)",
+                                       (t, c, "Seed Data"))
+                finally:
+                    con.close()
+            except Exception as e:
+                print(f"Error syncing seed to DB: {e}")
 
     def _load_database(self):
         # 1. Try to load persistent expansion (Gemini Data)
@@ -24,41 +76,29 @@ class RelationshipManager:
             try:
                 with open(self.STORAGE_PATH, 'r') as f:
                     self.database = json.load(f)
-                print(f"Loaded {len(self.database)} items from {self.STORAGE_PATH}")
             except Exception as e:
                 print(f"Error loading relationships: {e}")
-        else:
-            print("No persistence file found. Starting fresh.")
         
         # 2. Always sync with Seed (Golden Master)
-        print("Syncing database with S&P 500 seed...")
         self._load_seed()
-        self._save_database()
 
     def _load_seed(self):
         if os.path.exists(self.SEED_PATH):
             try:
                 with open(self.SEED_PATH, 'r') as f:
                     seed_data = json.load(f)
-                    
                     for k, v in seed_data.items():
                         if k not in self.database:
                             self.database[k] = v
                         else:
-                            # Overwrite metadata to ensure GICS standardization
                             self.database[k]["sector"] = v["sector"]
                             self.database[k]["industry"] = v["industry"]
-                            # Preserve found competitors. Only use seed if we have none.
                             if "competitors" in v and v["competitors"] and not self.database[k].get("competitors"):
                                 self.database[k]["competitors"] = v["competitors"]
-
             except Exception as e:
                 print(f"Error loading seed: {e}")
-        else:
-             print("Warning: Seed file not found.")
         
     def _save_database(self):
-        """Atomic save to prevent corruption"""
         try:
             os.makedirs(os.path.dirname(self.STORAGE_PATH), exist_ok=True)
             temp_path = self.STORAGE_PATH + ".tmp"
@@ -67,53 +107,145 @@ class RelationshipManager:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_path, self.STORAGE_PATH)
-            print(f"Saved {len(self.database)} items to {self.STORAGE_PATH}")
         except Exception as e:
-            print(f"CRITICAL ERROR SAVING DATABASE: {e}")
+            print(f"Error saving DB: {e}")
     
     def get_info(self, ticker: str) -> Optional[Dict]:
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                r = con.execute("SELECT name, sector, industry FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+                if r:
+                    return {
+                        "name": r[0], 
+                        "sector": r[1], 
+                        "industry": r[2], 
+                        "competitors": self.get_competitors(ticker)
+                    }
+                return None
+            except:
+                return None
+            finally:
+                con.close()
+                
         return self.database.get(ticker)
         
     def get_competitors(self, ticker: str) -> List[str]:
-        info = self.get_info(ticker)
+        if Config.USE_SYNTHETIC_DB and self.db:
+             con = self.db.get_connection()
+             try:
+                 res = con.execute("SELECT ticker_b FROM dim_competitors WHERE ticker_a=?", (ticker,)).fetchall()
+                 return [x[0] for x in res]
+             except:
+                 return []
+             finally:
+                 con.close()
+                 
+        info = self.database.get(ticker)
         if info:
             return info.get("competitors", [])
         return []
         
     def get_industry_peers(self, ticker, limit=10) -> List[str]:
-        info = self.get_info(ticker)
-        if not info:
-            return []
-            
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                # Find industry of ticker
+                r = con.execute("SELECT industry, sector FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+                if not r: 
+                    print(f"❌ Asset {ticker} not found in dim_assets during peer lookup.")
+                    return []
+                ind, sec = r
+                print(f"🔍 Peer Lookup for {ticker}: Sector='{sec}', Industry='{ind}'")
+                
+                # Find others in same industry
+                peers_query = """
+                    SELECT ticker FROM dim_assets 
+                    WHERE industry = ? AND ticker != ?
+                    LIMIT ?
+                """
+                peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
+                peer_list = [x[0] for x in peers]
+                
+                # Auto-Expand if empty and in Live/Synthetic Mode (Deep Research)
+                # Only if we have a valid key and didn't find much
+                if len(peer_list) < 3 and Config.GOOGLE_API_KEY:
+                     print(f"🧠 Just-in-Time AI Research for {ticker} Peers...")
+                     # Re-read industry in case it was unknown before but expand_knowledge fixes it?
+                     # expand_knowledge updates the ticker's industry too.
+                     if self.expand_knowledge(ticker):
+                         # Re-fetch industry just in case it changed from Unknown
+                         r2 = con.execute("SELECT industry FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+                         if r2:
+                             ind = r2[0]
+                             peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
+                             peer_list = [x[0] for x in peers]
+
+                # Fallback: If still few peers, try same SECTOR (Broader Context)
+                if len(peer_list) < 3:
+                     sector_query = """
+                        SELECT ticker FROM dim_assets 
+                        WHERE sector = ? AND ticker != ? AND industry != ?
+                        LIMIT ?
+                     """
+                     needed = limit - len(peer_list)
+                     if needed > 0:
+                         sec_peers = con.execute(sector_query, (sec, ticker, ind, needed)).fetchall()
+                         peer_list.extend([x[0] for x in sec_peers])
+
+                # Fallback 2: Sector Aliases (Handle YFinance vs GICS discrepancies)
+                if len(peer_list) < 3:
+                     aliases = {
+                         "Consumer Cyclical": ["Consumer Discretionary"],
+                         "Consumer Discretionary": ["Consumer Cyclical"],
+                         "Technology": ["Information Technology"],
+                         "Information Technology": ["Technology"],
+                         "Healthcare": ["Health Care"],
+                         "Health Care": ["Healthcare"],
+                         "Financial Services": ["Financials"],
+                         "Financials": ["Financial Services", "Finance"],
+                         "Finance": ["Financials"]
+                     }
+                     target_aliases = aliases.get(sec, [])
+                     # Only try aliases if we have them and still need peers
+                     if target_aliases:
+                         needed = limit - len(peer_list)
+                         if needed > 0:
+                             placeholders = ', '.join(['?'] * len(target_aliases))
+                             alias_query = f"""
+                                SELECT ticker FROM dim_assets 
+                                WHERE sector IN ({placeholders}) AND ticker != ?
+                                LIMIT ?
+                             """
+                             params = target_aliases + [ticker, needed]
+                             alias_peers = con.execute(alias_query, params).fetchall()
+                             peer_list.extend([x[0] for x in alias_peers])
+
+                return peer_list
+            finally:
+                con.close()
+
+        info = self.database.get(ticker)
+        if not info: return []
         target_industry = info["industry"]
-        target_sector = info["sector"]
-        
         peers = []
         for t, data in self.database.items():
-            if t == ticker:
-                continue
-            
-            # Match Industry (Primary)
+            if t == ticker: continue
             if data.get("industry") == target_industry:
                 peers.append(t)
-            # Match Sector (Secondary fallback if few industry matches)
-            # elif data.get("sector") == target_sector:
-            #      pass
-                 
         return peers[:limit]
 
     def expand_knowledge(self, ticker: str) -> bool:
         """
-        Uses Gemini to research a stock AND its competitors, adding them all to the database.
-        Returns True if successful.
+        Uses Gemini to research a stock AND its competitors.
         """
         api_key = Config.GOOGLE_API_KEY
-        if not api_key:
-            return False
+        if not api_key: return False
             
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            # Use gemini-flash-latest (valid free tier in this env)
+            model = genai.GenerativeModel('gemini-flash-latest')
             
             prompt = f"""
             Research the stock {ticker}.
@@ -135,39 +267,82 @@ class RelationshipManager:
             }}
             """
             
-            response = model.generate_content(prompt)
-            text = response.text.strip()
+            # Retry loop for Rate Limits
+            import time
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = model.generate_content(prompt)
+                    break # Success
+                except Exception as e:
+                    if "429" in str(e) and attempt < max_retries - 1:
+                        print(f"Ai Rate Limit (429). Retrying in 4s... ({attempt+1}/{max_retries})")
+                        time.sleep(4)
+                    else:
+                        raise e 
             
-            # Clean possible markdown code blocks
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
+            if not response: return False
+            # ... (Cleaning logic same as before)
+            text = response.text.strip()
+            if text.startswith("```json"): text = text[7:]
+            if text.startswith("```"): text = text[3:]
+            if text.endswith("```"): text = text[:-3]
                 
             data = json.loads(text.strip())
-            
-            # Process Target
             tgt = data.get("target")
             comps = data.get("competitors", [])
             
+            if Config.USE_SYNTHETIC_DB and self.db:
+                con = self.db.get_connection()
+                try:
+                    if tgt:
+                         con.execute("""
+                            UPDATE dim_assets 
+                            SET name=?, sector=?, industry=? 
+                            WHERE ticker=?
+                         """, (tgt.get("name"), tgt.get("sector"), tgt.get("industry"), ticker))
+                         # Also upsert if missing (in case UPDATE affects 0 rows)
+                         con.execute("""
+                            INSERT OR IGNORE INTO dim_assets (ticker, name, sector, industry)
+                            VALUES (?, ?, ?, ?)
+                         """, (ticker, tgt.get("name"), tgt.get("sector"), tgt.get("industry")))
+
+                    for c in comps:
+                        ct = c.get("ticker")
+                        if ct:
+                             con.execute("""
+                                INSERT OR IGNORE INTO dim_assets (ticker, name, sector, industry)
+                                VALUES (?, ?, ?, ?)
+                             """, (ct, c.get("name"), c.get("sector"), c.get("industry")))
+                             
+                             con.execute("""
+                                INSERT OR IGNORE INTO dim_competitors (ticker_a, ticker_b, reason)
+                                VALUES (?, ?, ?)
+                             """, (ticker, ct, "AI Identified"))
+                             
+                             # Also add reverse relationship for easier lookup
+                             con.execute("""
+                                INSERT OR IGNORE INTO dim_competitors (ticker_a, ticker_b, reason)
+                                VALUES (?, ?, ?)
+                             """, (ct, ticker, "AI Identified"))
+                    return True
+                except Exception as e:
+                    print(f"DB Expand Error: {e}")
+                    return False
+                finally:
+                    con.close()
+            
+            # --- JSON Fallback ---
             if tgt:
-                # Get existing data to preserve if needed, or simply update
                 current = self.database.get(ticker, {})
-                
-                # Update basic info
                 current["name"] = tgt.get("name", current.get("name"))
                 current["sector"] = tgt.get("sector", current.get("sector"))
                 current["industry"] = tgt.get("industry", current.get("industry"))
-                
-                # Update competitors list
                 comp_tickers = [c["ticker"] for c in comps]
                 current["competitors"] = comp_tickers
-                
                 self.database[ticker] = current
                 
-            # Process Competitors (Add them to DB if missing!)
             for c in comps:
                 c_ticker = c.get("ticker")
                 if c_ticker and c_ticker not in self.database:
@@ -175,9 +350,8 @@ class RelationshipManager:
                         "name": c.get("name"),
                         "sector": c.get("sector"),
                         "industry": c.get("industry"),
-                        "competitors": [] # We don't know their competitors yet
+                        "competitors": [] 
                     }
-            
             self._save_database()
             return True
                 

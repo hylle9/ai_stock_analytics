@@ -10,22 +10,47 @@ class GeminiAnalyst:
         self.api_key = Config.GOOGLE_API_KEY
         if self.api_key:
             genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-2.5-flash')
+            genai.configure(api_key=self.api_key)
+            genai.configure(api_key=self.api_key)
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-flash-latest')
         else:
             self.model = None
+
+    def _generate_synthetic_insight(self, ticker: str, context: str) -> str:
+        """Generates a realistic-looking mock insight for Synthetic Mode when API is rate limited."""
+        import random
+        trend = random.choice(["Bullish", "Bearish", "Neutral"])
+        rsi = random.uniform(30, 70)
+        
+        return f"""
+### 🤖 Synthetic AI Insight ({ticker})
+> **Note:** Real AI Rate Limit reached. Showing simulated data for testing.
+
+*   **Trend Analysis:** The synthetic signals suggest a **{trend}** outlook.
+*   **Technical Indicator:** RSI is effectively at **{rsi:.1f}**, indicating {trend} momentum.
+*   **Recommendation:** This is a generated placeholder to allow you to continue testing the UI flow without burning API quota.
+"""
+
+    def _safe_generate(self, prompt: str, ticker: str) -> str:
+        if not self.model:
+            return "Configuration Required: Please add GOOGLE_API_KEY to your .env file."
+            
+        try:
+            return self.model.generate_content(prompt).text
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "Quota" in err:
+                if Config.USE_SYNTHETIC_DB:
+                    print(f"⚠️ Rate Limit. Returning Synthetic Insight for {ticker}.")
+                    return self._generate_synthetic_insight(ticker, "Rate Limit")
+                return f"Error: 429 Rate Limit Exceeded. Please wait 60s."
+            return f"Error generating insight: {str(e)}"
 
     def analyze_news(self, ticker: str, news_items: list, metrics: dict) -> str:
         """
         Generates a summary explaining the connection between news and metrics.
-        
-        Args:
-            ticker: Stock symbol
-            news_items: List of news dictionaries
-            metrics: Dict containing 'rsi', 'sentiment_score', 'attention_score'
         """
-        if not self.model:
-            return "Configuration Required: Please add GOOGLE_API_KEY to your .env file to enable AI Research Clues."
-            
         if not news_items:
             return "No recent news available to analyze."
 
@@ -57,25 +82,17 @@ class GeminiAnalyst:
         Format as markdown with bold points.
         """
         
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            return f"Error generating AI insight: {str(e)}"
+        return self._safe_generate(prompt, ticker)
 
     def analyze_technicals(self, ticker: str, data: object) -> str:
         """
         Analyzes raw technical data to provide trends and buy/sell guidance.
-        
-        Args:
-            ticker: Stock symbol
-            data: DataFrame containing technical indicators (tail)
         """
-        if not self.model:
-             return "Configuration Required: Please add GOOGLE_API_KEY to your .env file."
-             
         # Convert dataframe to markdown table for the prompt
-        table_md = data.to_markdown(index=True)
+        try:
+            table_md = data.to_markdown(index=True)
+        except:
+            table_md = str(data)
         
         prompt = f"""
         You are an expert Technical Analyst. I will provide you with the last few days of raw technical data for {ticker}.
@@ -93,11 +110,8 @@ class GeminiAnalyst:
         **CRITICAL: Do NOT use LaTeX or Math formatting for numbers (e.g. no $x$ or \(x\)). Use standard text only.**
         """
         
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            return f"Error analyzing trends: {str(e)}"
+        return self._safe_generate(prompt, ticker)
+
     def perform_deep_research(self, ticker: str, news_items: list, metrics: dict) -> str:
         """
         Conducts a 'Deep Research' session using Gemini 1.5 Pro (if avail) or best model.
@@ -142,7 +156,7 @@ class GeminiAnalyst:
         """
         
         # Robust Model Selection with Fallback (Updated based on available models)
-        candidates = ["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+        candidates = ["gemini-1.5-pro", "gemini-2.5-flash"]
         
         last_error = None
         for model_name in candidates:
@@ -154,6 +168,8 @@ class GeminiAnalyst:
                 err_str = str(e)
                 # Fail fast on Rate Limits (Quota) to avoid burning retries on shared quota
                 if "429" in err_str or "Quota" in err_str or "quota" in err_str:
+                     if Config.USE_SYNTHETIC_DB:
+                         return self._generate_synthetic_insight(ticker, "Deep Research Rate Limit")
                      return "⚠️ **Rate Limit Hit**: Gemini Free Tier quota exceeded. Please wait ~60 seconds and try again."
                 
                 last_error = e

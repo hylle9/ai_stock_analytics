@@ -92,6 +92,10 @@ class Portfolio:
         allocation['CASH'] = self.cash / total_value
         return allocation
 
+from src.utils.config import Config
+if Config.USE_SYNTHETIC_DB:
+    pass
+
 class PortfolioManager:
     """
     Manages multiple portfolios with persistence.
@@ -100,7 +104,14 @@ class PortfolioManager:
 
     def __init__(self):
         self.portfolios: Dict[str, Portfolio] = {}
-        self.load_portfolios()
+        
+        if Config.USE_SYNTHETIC_DB:
+            from src.data.db_manager import DBManager
+            self.db = DBManager()
+            self.load_portfolios_from_db()
+        else:
+            self.db = None
+            self.load_portfolios()
         
     def load_portfolios(self):
         if os.path.exists(self.STORAGE_PATH):
@@ -113,6 +124,31 @@ class PortfolioManager:
             except Exception as e:
                 print(f"Error loading portfolios: {e}")
 
+    def load_portfolios_from_db(self):
+         con = self.db.get_connection()
+         try:
+             # Load Portfolios
+             p_rows = con.execute("SELECT portfolio_id, name, status, cash FROM dim_portfolios").fetchall()
+             for r in p_rows:
+                 pid, name, status_str, cash = r
+                 try:
+                     status = PortfolioStatus(status_str)
+                 except: 
+                     status = PortfolioStatus.PAUSED
+                 
+                 p = Portfolio(name, cash, status, pid)
+                 
+                 # Load Holdings
+                 h_rows = con.execute("SELECT ticker, quantity FROM fact_holdings WHERE portfolio_id=?", (pid,)).fetchall()
+                 for hr in h_rows:
+                     p.holdings[hr[0]] = int(hr[1])
+                     
+                 self.portfolios[pid] = p
+         except Exception as e:
+             print(f"DB Load Portfolios Error: {e}")
+         finally:
+             con.close()
+
     def save_portfolios(self):
         os.makedirs(os.path.dirname(self.STORAGE_PATH), exist_ok=True)
         data = [p.to_dict() for p in self.portfolios.values()]
@@ -122,13 +158,24 @@ class PortfolioManager:
     def create_portfolio(self, name: str, initial_cash: float = 100000.0) -> Portfolio:
         p = Portfolio(name, initial_cash)
         self.portfolios[p.id] = p
-        self.save_portfolios()
+        if Config.USE_SYNTHETIC_DB:
+            self.save_portfolio(p)
+        else:
+            self.save_portfolios()
         return p
         
     def delete_portfolio(self, portfolio_id: str):
         if portfolio_id in self.portfolios:
             del self.portfolios[portfolio_id]
-            self.save_portfolios()
+            if Config.USE_SYNTHETIC_DB and self.db:
+                con = self.db.get_connection()
+                try:
+                    con.execute("DELETE FROM fact_holdings WHERE portfolio_id=?", (portfolio_id,))
+                    con.execute("DELETE FROM dim_portfolios WHERE portfolio_id=?", (portfolio_id,))
+                finally:
+                    con.close()
+            else:
+                self.save_portfolios()
             
     def get_portfolio(self, portfolio_id: str) -> Optional[Portfolio]:
         return self.portfolios.get(portfolio_id)
@@ -136,6 +183,33 @@ class PortfolioManager:
     def save_portfolio(self, portfolio: Portfolio):
         """Explicit save trigger for updates"""
         self.portfolios[portfolio.id] = portfolio
+        
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                # Upsert Portfolio (Delete then Insert to update mutable fields)
+                con.execute("DELETE FROM dim_portfolios WHERE portfolio_id=?", (portfolio.id,))
+                con.execute("""
+                    INSERT INTO dim_portfolios (portfolio_id, name, status, cash)
+                    VALUES (?, ?, ?, ?)
+                """, (portfolio.id, portfolio.name, portfolio.status.value, portfolio.cash))
+                
+                # Sync Holdings (Delete all and re-insert)
+                con.execute("DELETE FROM fact_holdings WHERE portfolio_id=?", (portfolio.id,))
+                
+                for t, q in portfolio.holdings.items():
+                    # Ensure Asset Exists
+                    con.execute("INSERT OR IGNORE INTO dim_assets (ticker) VALUES (?)", (t,))
+                    con.execute("""
+                        INSERT INTO fact_holdings (portfolio_id, ticker, quantity, avg_buy_price)
+                        VALUES (?, ?, ?, 0)
+                    """, (portfolio.id, t, float(q)))
+            except Exception as e:
+                print(f"DB Save Portfolio Error: {e}")
+            finally:
+                con.close()
+            return
+            
         self.save_portfolios()
         
     def list_portfolios(self) -> List[Portfolio]:

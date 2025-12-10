@@ -636,6 +636,18 @@ class DataFetcher:
         """
         profile = {}
         
+        # 0. Try DB First (Optimization)
+        if Config.USE_SYNTHETIC_DB and self.db:
+            try:
+                # We can reuse fetch_key_metrics logic via DB or check dim_assets
+                # fetch_key_metrics returns {pe, market_cap, sector, industry, name}
+                db_profile = self.db.fetch_key_metrics(ticker)
+                if db_profile and db_profile.get('name'):
+                    db_profile["_source"] = "🟠 CACHE (DB)"
+                    return db_profile
+            except Exception as e:
+                pass
+
         # 1. Try Live (Preferred for profile data which changes rarely but needs to be accurate initially)
         if self.live_provider:
             try:
@@ -665,13 +677,22 @@ class DataFetcher:
             
         return self.provider.search_assets(query)
         
-    def get_fundamentals(self, ticker: str) -> dict:
+    def get_fundamentals(self, ticker: str, allow_fallback: bool = True) -> dict:
         """
         Fetch fundamental metrics like P/E.
         """
-        if Config.USE_SYNTHETIC_DB:
-             data = self.provider.fetch_key_metrics(ticker)
+        # Special Case: Metadata tickers
+        if ticker.startswith("$"):
+            return {'pe_ratio': 0.0, 'market_cap': 0.0}
+
+        if Config.USE_SYNTHETIC_DB and self.db:
+             data = self.db.fetch_key_metrics(ticker)
              data["_source"] = "🟠 CACHE (DB)"
+             
+             # If we disallow fallback (e.g. for fast dashboard), return what we have
+             if not allow_fallback:
+                 return data
+
              # If valid data found (pe_ratio > 0 is a heuristic, key check better)
              if data.get('market_cap', 0) > 0 or data.get('pe_ratio', 0) > 0:
                  return data

@@ -126,6 +126,7 @@ def main():
         if rising_stocks:
              all_tickers.extend([f['ticker'] for f in rising_stocks])
              
+        all_tickers.extend(["RSP", "SPY"]) # Ensure Benchmarks are present
         all_tickers = list(set(all_tickers)) # Unique
         
         # Fetch ALL data in one go
@@ -147,6 +148,7 @@ def main():
                     ticker = fav['ticker']
                     # Look up pre-fetched data
                     df = batch_data.get(ticker, pd.DataFrame())
+                    rsp_df = batch_data.get("RSP", pd.DataFrame())
                     
                     with l_cols[idx % 4]:
                         with st.container():
@@ -163,7 +165,7 @@ def main():
                             try:
                                 with Timer(f"API:Alpha:{fav['ticker']}"):
                                     from src.analytics.market_comparison import calculate_market_alpha
-                                    alpha = calculate_market_alpha(fav['ticker'])
+                                    alpha = calculate_market_alpha(fav['ticker'], stock_df=df, benchmark_df=rsp_df)
                                 if alpha > 0:
                                     beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
                                 else:
@@ -174,7 +176,7 @@ def main():
 
                             # P/E Ratio
                             with Timer(f"API:Fundamentals:{fav['ticker']}"):
-                                fund = get_cached_fundamentals(fav['ticker'])
+                                fund = fetcher.get_fundamentals(fav['ticker'], allow_fallback=False)
                             pe = fund.get('pe_ratio', 0)
                             pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
                             st.caption(pe_str)
@@ -199,6 +201,7 @@ def main():
                     ticker = fav['ticker']
                     # Look up pre-fetched data
                     df = batch_data.get(ticker, pd.DataFrame())
+                    rsp_df = batch_data.get("RSP", pd.DataFrame())
                     
                     with f_cols[idx % 4]:
                         with st.container():
@@ -215,7 +218,7 @@ def main():
                             try:
                                 with Timer(f"API:Alpha:{ticker}"):
                                     from src.analytics.market_comparison import calculate_market_alpha
-                                    alpha = calculate_market_alpha(ticker)
+                                    alpha = calculate_market_alpha(ticker, stock_df=df, benchmark_df=rsp_df)
                                 if alpha > 0:
                                     beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
                                 else:
@@ -226,7 +229,7 @@ def main():
     
                             # P/E Ratio
                             with Timer(f"API:Fundamentals:{ticker}"):
-                                fund = get_cached_fundamentals(ticker)
+                                fund = fetcher.get_fundamentals(ticker, allow_fallback=False)
                             pe = fund.get('pe_ratio', 0)
                             pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
                             st.caption(pe_str)

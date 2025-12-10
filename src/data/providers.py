@@ -59,7 +59,7 @@ class StockTwitsProvider:
         """
         try:
             url = self.BASE_URL.format(ticker)
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=2.0) # Fast timeout for UI responsiveness
             if resp.status_code == 200:
                 data = resp.json()
                 messages = data.get('messages', [])
@@ -92,7 +92,7 @@ class AlphaVantageProvider(BaseDataProvider):
             params["symbol"] = symbol
             
         try:
-            response = requests.get(self.BASE_URL, params=params, timeout=10)
+            response = requests.get(self.BASE_URL, params=params, timeout=3.0) # Reduced from 10s
             response.raise_for_status()
             return response.json()
         except Exception as e:

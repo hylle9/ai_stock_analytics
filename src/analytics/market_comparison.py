@@ -4,25 +4,25 @@ import streamlit as st
 from src.analytics.technical import add_technical_features
 
 @st.cache_data(ttl=3600)
-def calculate_market_alpha(ticker: str, benchmark_ticker: str = "SPY", period: str = "1y") -> float:
+def calculate_market_alpha(ticker: str, stock_df: pd.DataFrame = None, benchmark_df: pd.DataFrame = None, period: str = "1y") -> float:
     """
     Calculates Alpha (Excess Return vs Benchmark) over the period.
     Simple Metric: (Ticker Return - Benchmark Return).
     Returns 0.0 if data is insufficient.
+    Accepts pre-fetched DataFrames to avoid redundant API calls.
     """
-    fetcher = DataFetcher()
-    
-    # 1. Fetch Stock Data
-    df = fetcher.fetch_ohlcv(ticker, period=period)
-    if df.empty:
+    if stock_df is None or benchmark_df is None:
         return 0.0
-    df = add_technical_features(df)
     
-    # 2. Fetch Benchmark (RSP)
-    bench_df = fetcher.fetch_ohlcv("RSP", period="max") # Max for full SMA coverage
-    if bench_df.empty:
-        return 0.0
-    bench_df = add_technical_features(bench_df)
+    df = stock_df.copy() # Avoid mutating original
+    bench_df = benchmark_df.copy()
+    
+    # Feature Engineer if needed (assuming batch fetch creates raw data)
+    # Check if 'sma_50' exists, if not add it
+    if 'sma_50' not in df.columns:
+        df = add_technical_features(df)
+    if 'sma_50' not in bench_df.columns:
+        bench_df = add_technical_features(bench_df)
     
     # Slice benchmark to match stock start
     start_date = df.index.min()

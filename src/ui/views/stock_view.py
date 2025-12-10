@@ -58,46 +58,48 @@ def load_dashboard_data_v2(ticker: str):
     data["valid"] = True
     
     # 2. Fire-and-forget profile
-    if Config.DATA_STRATEGY != "LEGACY":
-         try:
-             fetcher.get_company_profile(ticker)
-         except Exception as e:
-             data["profile_error"] = str(e)
+    # BLOCKED: This call was taking 17s in Production (likely API rate limit hang). 
+    # Profile data is optional or lazily loaded elsewhere.
+    # if Config.DATA_STRATEGY != "LEGACY":
+    #      try:
+    #          fetcher.get_company_profile(ticker)
+    #      except Exception as e:
+    #          data["profile_error"] = str(e)
 
     # 3. Technicals (on Max)
     # Re-use existing cached tech function or call directly
     # Since we are inside a cached function, calling another cached function is fine but maybe redundant.
     # Let's call direct to save overhead or use the utility.
-    df_analysis = add_technical_features(df_analysis)
+    with Timer(f"TechFeatures:Main:{ticker}"):
+        df_analysis = add_technical_features(df_analysis)
     data["df_analysis"] = df_analysis
 
     # 4. Benchmark (Max)
     bench_df = fetcher.fetch_ohlcv("RSP", period="max")
     if not bench_df.empty:
-        bench_df = add_technical_features(bench_df)
+        with Timer("TechFeatures:Bench"):
+             bench_df = add_technical_features(bench_df)
         # Align dates
         start_date = df_analysis.index.min()
         bench_df = bench_df[bench_df.index >= start_date]
         data["bench_df"] = bench_df
 
     # 5. Alt Data & News
-    alt_data = fetcher.fetch_alt_data(ticker)
+    with Timer(f"API:AltData:{ticker}"):
+        alt_data = fetcher.fetch_alt_data(ticker)
     data["alt_data"] = alt_data
     
-    news = fetcher.fetch_news(ticker, limit=100)
+    with Timer(f"API:News:{ticker}"):
+        news = fetcher.fetch_news(ticker, limit=20)
     data["news"] = news
 
     # 6. Analysis / Scores
     # Sentiment
-    analyzer = SentimentAnalyzer()
-    news_score = analyzer.analyze_news(news)
+    with Timer("Analyzer:Sentiment"):
+        analyzer = SentimentAnalyzer()
+        news_score = analyzer.analyze_news(news)
     data["news_score"] = news_score
     
-    # Pressure Score Logic
-    fusion = FusionEngine()
-    
-    # Normalization inputs
-
     # Pressure Score Logic
     fusion = FusionEngine()
     
@@ -121,14 +123,15 @@ def load_dashboard_data_v2(ticker: str):
     rel_vol = calculate_relative_volume(df_analysis, window=20)
     vol_acc = calculate_volume_acceleration(df_analysis, window=3)
 
-    pressure_score = fusion.calculate_pressure_score(
-        price_trend=trend_norm,
-        volatility_rank=vol_norm,
-        sentiment_score=news_score,
-        attention_score=att_norm,
-        relative_volume=rel_vol,
-        volume_acceleration=vol_acc
-    )
+    with Timer("Analyzer:Fusion"):
+        pressure_score = fusion.calculate_pressure_score(
+            price_trend=trend_norm,
+            volatility_rank=vol_norm,
+            sentiment_score=news_score,
+            attention_score=att_norm,
+            relative_volume=rel_vol,
+            volume_acceleration=vol_acc
+        )
     data["pressure_score"] = pressure_score
     
     # Save components for UI
@@ -146,11 +149,16 @@ def load_dashboard_data_v2(ticker: str):
     
     # 7. Peer Benchmarks (Consolidated)
     peers = []
+    # 7. Peer Benchmarks (Consolidated)
+    peers = []
     try:
-        rm = RelationshipManager()
-        peers = rm.get_industry_peers(ticker, limit=4)
-        if not peers:
-             peers = [t for t in defaults.DEFAULT_UNIVERSE_TICKERS if t != ticker][:4]
+        with Timer(f"Peers:Init:{ticker}"):
+            rm = RelationshipManager()
+            
+        with Timer(f"Peers:Query:{ticker}"):
+            peers = rm.get_industry_peers(ticker, limit=4)
+            if not peers:
+                  peers = [t for t in defaults.DEFAULT_UNIVERSE_TICKERS if t != ticker][:4]
     except Exception as e:
         print(f"RM Error: {e}")
     
@@ -161,16 +169,29 @@ def load_dashboard_data_v2(ticker: str):
     # Batch Fetch for performance
     try:
         if peers:
-            peer_results = fetcher.fetch_batch_ohlcv(peers, period="6mo")
+            # Note: Fetch Batch OHLCV prints "Batch DB returned..."
+            with Timer(f"Peers:Fetch:{ticker}"):
+                 peer_results = fetcher.fetch_batch_ohlcv(peers, period="6mo")
             
-            for p in peers:
-                pdf = peer_results.get(p, pd.DataFrame())
-                if not pdf.empty:
-                    try:
-                        pdf = add_technical_features(pdf)
-                        if 'rsi' in pdf.columns:
-                            rsi_vals.append(pdf['rsi'].iloc[-1])
-                    except: pass
+            with Timer(f"Peers:Process:{ticker}"):
+                for p in peers:
+                    pdf = peer_results.get(p, pd.DataFrame())
+                    if not pdf.empty:
+                        try:
+                            # OPTIMIZATION: We only need the latest RSI for the peer comparison metric.
+                            # We do NOT need to calculate technicals on 20 years of data.
+                            # Slicing to last 150 days is sufficient for RSI-14 to stabilize.
+                            # This fixes the 16s delay loop.
+                            if len(pdf) > 200:
+                                pdf_slice = pdf.tail(200).copy()
+                            else:
+                                pdf_slice = pdf.copy()
+                                
+                            pdf_slice = add_technical_features(pdf_slice)
+                            
+                            if 'rsi' in pdf_slice.columns:
+                                rsi_vals.append(pdf_slice['rsi'].iloc[-1])
+                        except: pass
     except Exception as e:
         print(f"Peer Batch Error: {e}")
 
@@ -199,59 +220,31 @@ def load_dashboard_data_v2(ticker: str):
     
     im = InsightManager()
     
-    # Weekly Deep
-    cached_weekly = im.get_todays_insight(ticker, report_type="deep_research_weekly", valid_days=7)
-    if cached_weekly and ("Rate Limit" in cached_weekly or "Quota" in cached_weekly):
-         cached_weekly = None
-    data["deep_insight_weekly"] = cached_weekly
-    
-    # Daily
-    cached_daily = im.get_todays_insight(ticker, report_type="deep_dive", valid_days=1)
-    if not cached_daily:
-        # Generate new if missing
-        # NOTE: This makes the first load slower, but ensures 1-hour stability.
-        # We need to replicate the generation logic
-        analyst = GeminiAnalyst()
-        metrics_context = {
-            'rsi': rsi,
-            'sentiment_score': news_score,
-            'attention_score': cur_att,
-            'alpha_50': 0, # calculated later or approximate here? market_alpha needs DB
-            'pressure_score': pressure_score
-        }
-        # Try-except to allow data loading even if AI fails
-        try:
-             report = analyst.analyze_news(ticker, news, metrics_context)
-             if "Error" not in report:
-                 im.save_insight(ticker, report, report_type="deep_dive")
-                 cached_daily = report
-        except:
-             pass
-    
-    data["ai_insight"] = cached_daily
-    
-    
-    # 9. Technical Insight (Pattern Recognition)
-    # Strategy: Daily Cache (Standard "Technical" Report)
-    cached_to_tech = im.get_todays_insight(ticker, report_type="technical")
-    if not cached_to_tech:
-        try:
-             analyst = GeminiAnalyst()
-             # Use last 20 periods for patterns
-             tech_report = analyst.analyze_technicals(ticker, df_analysis.tail(20))
-             if "Error" not in tech_report:
-                 im.save_insight(ticker, tech_report, report_type="technical")
-                 cached_to_tech = tech_report
-        except:
-             pass
-    data["technical_insight"] = cached_to_tech
+    with Timer(f"InsightManager:Load:{ticker}"):
+        # Weekly Deep
+        cached_weekly = im.get_todays_insight(ticker, report_type="deep_research_weekly", valid_days=7)
+        if cached_weekly and ("Rate Limit" in cached_weekly or "Quota" in cached_weekly):
+             cached_weekly = None
+        data["deep_insight_weekly"] = cached_weekly
+        
+        # Daily
+        cached_daily = im.get_todays_insight(ticker, report_type="deep_dive", valid_days=1)
+        # DEFERRED: Generation moved to render_stock_view to allow UI to load first.
+        
+        data["ai_insight"] = cached_daily
+        
+        
+        # 9. Technical Insight (Pattern Recognition)
+        # Strategy: Daily Cache (Standard "Technical" Report)
+        cached_to_tech = im.get_todays_insight(ticker, report_type="technical")
+        # DEFERRED: Generation moved to render_stock_view
+        data["technical_insight"] = cached_to_tech
 
-    # 10. Tracker Log (Side effect, maybe keep in UI? No, log once per hour load is fine/better)
-    # actually logging view should happen when user views it. A cache rebuild might happen in background?
-    # Streamlit cache runs only when called. So this is user-driven.
+    # 10. Tracker Log (Side effect)
     try:
-         tracker = ActivityTracker()
-         tracker.log_view(ticker, pressure_score)
+        with Timer(f"Tracker:LogView:{ticker}"):
+             tracker = ActivityTracker()
+             tracker.log_view(ticker, pressure_score)
     except:
          pass
 
@@ -485,10 +478,12 @@ def render_stock_view():
         
         # --- NEW: Consolidated Data Load ---
         # This blocks on first run, then is instant for 1 hour.
-        with st.spinner(f"⚡ Loading Dashboard for {ticker}..."):
-            dashboard_data = load_dashboard_data_v2(ticker)
-            
-        if not dashboard_data["valid"]:
+        # Fetch Dashboard Data
+        with Timer(f"StockView:LoadData:{ticker}"):
+             dashboard_data = load_dashboard_data_v2(ticker)
+        
+        # Check if data loaded
+        if dashboard_data['df_analysis'].empty: # Changed from 'main_df' to 'df_analysis'
              st.error(f"No data found for ticker '{ticker}'. Please ensure valid ticker, internet connection, or try again.")
              return
 
@@ -628,11 +623,9 @@ def render_stock_view():
                 st.success(f"Standard Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
                 st.markdown(cached_daily)
             else:
-                 # This path should mostly be covered by the cache loader now,
-                 # but if cache loader failed to gen, we offer button.
-                # Generate Standard
-                if st.button("Generate AI Insight"):
-                    with st.spinner("Gemini is connecting the dots..."):
+                # Auto-Generate Standard Insight (Lazy Load)
+                with st.spinner("🤖 Gemini is analyzing news & fundamentals..."):
+                    try:
                         analyst = GeminiAnalyst()
                         metrics_context = {
                             'rsi': rsi,
@@ -645,16 +638,18 @@ def render_stock_view():
                         
                         if "Error" not in report:
                             im.save_insight(ticker, report, report_type="deep_dive")
-                            st.rerun()
+                            st.markdown(report)
                         else:
-                            st.error(report)
+                            st.warning(f"AI could not generate report: {report}")
+                    except Exception as e:
+                        st.warning(f"AI Generation failed: {e}")
 
             # 3. Deep Research Upgrade Option
             st.write("#### 🧬 Need Deeper Answers?")
             
             # Safe Alpha Check
             from src.analytics.market_comparison import calculate_market_alpha
-            market_alpha = calculate_market_alpha(ticker)
+            market_alpha = calculate_market_alpha(ticker, stock_df=dashboard_data.get('main_df'), benchmark_df=dashboard_data.get('bench_df'))
             
             st.caption(f"Unlock implied mixed signals or verify why {ticker} is {'beating' if market_alpha > 0 else 'trailing'} the market.")
             
@@ -687,17 +682,18 @@ def render_stock_view():
             st.success(f"Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
             st.markdown(cached_insight)
         else:
-            # Fallback if cache failed to generate (e.g. rate limit during load)
-            if st.button("Generate Technical Analysis"):
-                 with st.spinner("Analyzing chart patterns..."):
+            # Auto-Generate Technicals (Lazy Load)
+            with st.spinner("📈 Analyzing chart patterns..."):
+                try:
                     analyst = GeminiAnalyst()
-                    # Use analysis df for pattern recognition
                     tech_report = analyst.analyze_technicals(ticker, df_analysis.tail(20))
                     if "Error" not in tech_report:
                         im.save_insight(ticker, tech_report, report_type="technical")
                         st.markdown(tech_report)
                     else:
-                        st.error(tech_report)
+                        st.warning(tech_report)
+                except Exception as e:
+                    st.warning(f"Technical Analysis failed: {e}")
 
         # --- SECTION 2: PRICE & TECHNICALS (Was Tab 1) ---
         st.divider()
@@ -824,7 +820,9 @@ def render_stock_view():
             if start_200 > 0:
                 st.caption(f"ℹ️ The **S&P 500 Trend** line is visually scaled to start at {ticker}'s price (${start_200:.2f}) to make the growth comparison easy.")
 
-            fig, last_cross_date = plot_stock_chart(chart_df, ticker, forecast_df, benchmark_df=bench_plot_df)
+            # Main Chart
+            with Timer("StockView:PlotChart"):
+                fig, last_cross_date = plot_stock_chart(chart_df, ticker, forecast_df, benchmark_df=bench_plot_df)
                 
             # Display Last Golden Cross
             if last_cross_date:

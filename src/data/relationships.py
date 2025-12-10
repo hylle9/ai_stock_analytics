@@ -45,6 +45,13 @@ class RelationshipManager:
                 
                 con = self.db.get_connection()
                 try:
+                    # OPTIMIZATION: Check if data exists first!
+                    # If dim_assets has > 50 rows, we assume seed is loaded.
+                    # This prevents 14s init delay on every page load.
+                    count = con.execute("SELECT COUNT(*) FROM dim_assets").fetchone()[0]
+                    if count >= 50:
+                         return
+                    
                     for t, v in seed_data.items():
                         # Unpack
                         name = v.get("name", t)
@@ -166,15 +173,18 @@ class RelationshipManager:
                 """
                 peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
                 peer_list = [x[0] for x in peers]
-                
-                # Auto-Expand if empty and in Live/Synthetic Mode (Deep Research)
-                # OPTIMIZATION: Check for recent update (Weekly Frequency) before triggering AI
+                # Auto-Expand if empty
+                # TRACE: Finding the hang
                 if len(peer_list) < 3 and Config.GOOGLE_API_KEY:
                      should_expand = False
                      
                      # Check last update time
                      try:
+                         # print(f"DEBUG: Checking dim_competitors for {ticker}...")
+                         # TIMEOUT GUARD: If this query hangs, we assume stale.
+                         # Although DuckDB shouldn't hang on read.
                          last_update_row = con.execute("SELECT MAX(created_at) FROM dim_competitors WHERE ticker_a=?", (ticker,)).fetchone()
+                         # print(f"DEBUG: Check complete. Row: {last_update_row}")
                          if last_update_row and last_update_row[0]:
                              last_ts = last_update_row[0]
                              # DuckDB returns datetime

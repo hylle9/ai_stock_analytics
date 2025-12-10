@@ -168,18 +168,36 @@ class RelationshipManager:
                 peer_list = [x[0] for x in peers]
                 
                 # Auto-Expand if empty and in Live/Synthetic Mode (Deep Research)
-                # Only if we have a valid key and didn't find much
+                # OPTIMIZATION: Check for recent update (Weekly Frequency) before triggering AI
                 if len(peer_list) < 3 and Config.GOOGLE_API_KEY:
-                     print(f"🧠 Just-in-Time AI Research for {ticker} Peers...")
-                     # Re-read industry in case it was unknown before but expand_knowledge fixes it?
-                     # expand_knowledge updates the ticker's industry too.
-                     if self.expand_knowledge(ticker):
-                         # Re-fetch industry just in case it changed from Unknown
-                         r2 = con.execute("SELECT industry FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
-                         if r2:
-                             ind = r2[0]
-                             peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
-                             peer_list = [x[0] for x in peers]
+                     should_expand = False
+                     
+                     # Check last update time
+                     try:
+                         last_update_row = con.execute("SELECT MAX(created_at) FROM dim_competitors WHERE ticker_a=?", (ticker,)).fetchone()
+                         if last_update_row and last_update_row[0]:
+                             last_ts = last_update_row[0]
+                             # DuckDB returns datetime
+                             from datetime import datetime, timedelta
+                             if (datetime.now() - last_ts).days > 7:
+                                 should_expand = True
+                             else:
+                                 print(f"✨ InsightManager: Peer Knowledge is fresh (Updated {last_ts}). Skipping AI.")
+                         else:
+                             should_expand = True # Never checked
+                     except Exception as e:
+                         print(f"Peer Check Warning: {e}")
+                         should_expand = True # Default to try if check fails
+                     
+                     if should_expand:
+                         print(f"🧠 Just-in-Time AI Research for {ticker} Peers (Weekly Refresh)...")
+                         if self.expand_knowledge(ticker):
+                             # Re-fetch industry
+                             r2 = con.execute("SELECT industry FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+                             if r2:
+                                 ind = r2[0]
+                                 peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
+                                 peer_list = [x[0] for x in peers]
 
                 # Fallback: If still few peers, try same SECTOR (Broader Context)
                 if len(peer_list) < 3:
@@ -250,7 +268,7 @@ class RelationshipManager:
             prompt = f"""
             Research the stock {ticker}.
             1. Identify its correct GICS Sector and Industry.
-            2. Identify its Top 5 Direct Competitors (Publicly Traded).
+            2. Identify its Top 5-10 Direct Competitors (Publicly Traded).
             
             Return STRICTLY valid JSON (no markdown). Structure:
             {{
@@ -326,6 +344,10 @@ class RelationshipManager:
                                 INSERT OR IGNORE INTO dim_competitors (ticker_a, ticker_b, reason)
                                 VALUES (?, ?, ?)
                              """, (ct, ticker, "AI Identified"))
+                             
+                    # CRITICAL FIX: Update timestamp for ALL competitors (new and old) to prevent infinite JIT loop
+                    con.execute("UPDATE dim_competitors SET created_at = CURRENT_TIMESTAMP WHERE ticker_a = ?", (ticker,))
+                    print(f"✅ Peer Knowledge Updated for {ticker}")
                     return True
                 except Exception as e:
                     print(f"DB Expand Error: {e}")
@@ -359,6 +381,45 @@ class RelationshipManager:
             print(f"Gemini Expansion Error: {e}")
             
         return False
+
+    def extract_tickers_from_text(self, text: str) -> List[str]:
+        """
+        Uses Gemini to extract stock tickers from text (news headlines/summaries).
+        """
+        api_key = Config.GOOGLE_API_KEY
+        if not api_key: return []
+            
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel('gemini-flash-latest')
+            
+            prompt = f"""
+            Identify all publicly traded stock tickers mentioned in the following text.
+            Text: "{text}"
+            
+            Return STRICTLY valid JSON (no markdown) as a list of strings.
+            Example: ["AAPL", "GOOGL"]
+            If none, return [].
+            """
+            
+            response = model.generate_content(prompt)
+            if not response: return []
+            
+            cleaned_text = response.text.strip()
+            if cleaned_text.startswith("```json"): cleaned_text = cleaned_text[7:]
+            if cleaned_text.startswith("```"): cleaned_text = cleaned_text[3:]
+            if cleaned_text.endswith("```"): cleaned_text = cleaned_text[:-3]
+            
+            tickers = json.loads(cleaned_text.strip())
+            if isinstance(tickers, list):
+                # Basic validation (uppercase, 1-5 chars)
+                return [t.upper() for t in tickers if isinstance(t, str) and 1 <= len(t) <= 5]
+            return []
+            
+        except Exception as e:
+            print(f"Gemini Ticker Extraction Error: {e}")
+            return []
+
 
     def get_recommendations_for_portfolio(self, holdings: List[str]) -> Dict[str, List[Dict]]:
         """

@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 # Force Reload
 import sys
 import os
@@ -12,6 +13,7 @@ from src.ui.views.risk_view import render_risk_view
 from src.ui.views.portfolio_view import render_portfolio_view, initialize_portfolio_manager
 
 from src.models.portfolio import PortfolioManager, PortfolioStatus
+import pandas as pd
 
 
 # Helper for programmatic navigation
@@ -31,6 +33,14 @@ def navigate_to_analysis(ticker):
     st.session_state.analysis_ticker = ticker
     st.session_state.navigation_page = "Stock Analysis"
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cached_fundamentals(ticker: str):
+    """Cached fetch for fundamentals (P/E, Market Cap). Changes slowly."""
+    # Instantiate simpler fetcher/provider solely for this call to avoid hashing issues
+    from src.data.ingestion import DataFetcher
+    local_fetcher = DataFetcher()
+    return local_fetcher.get_fundamentals(ticker)
+
 def render_sidebar():
     with st.sidebar:
         st.title("AI Stock Lab")
@@ -48,7 +58,9 @@ def render_sidebar():
         st.write("Navigation")
 
 def main():
-    st.set_page_config(page_title="AI Stock Lab", layout="wide")
+    from src.utils.profiling import Timer
+    # Global Config for Page
+    st.set_page_config(layout="wide", page_title="AI Stock Lab")
     initialize_portfolio_manager()
     
     render_sidebar()
@@ -63,57 +75,118 @@ def main():
         st.title("Market Dashboard")
         st.write("---")
         
-        # --- EXPLICIT FAVORITES (LIKED) ---
+        # --- MARKET WEATHER WIDGET ---
         from src.analytics.activity import ActivityTracker
         from src.data.ingestion import DataFetcher
         tracker = ActivityTracker()
-        fetcher = DataFetcher()
+    
+        # Check Read-Only Status
+        is_read_only = getattr(tracker, "read_only", False)
+        if is_read_only:
+            st.sidebar.warning("🔒 **Read-Only Mode**\nDCS is running in background. New actions (Likes) will not be saved.")
         
+        # Re-enable this if we want to toggle live/synthetic from UI
+        fetcher = DataFetcher()
+        # Optimize: Pre-fetch dates for batch performance
+        fetcher.warmup_cache()
+
+        weather = tracker.get_market_weather()
+        if weather:
+            w_score = weather.get("score", 50.0)
+            w_status = weather.get("status", "NEUTRAL")
+            w_time = weather.get("last_updated", "")
+            
+            # Color logic
+            if w_score > 65: 
+                w_color = "green"
+                w_icon = "🔥"
+            elif w_score < 35: 
+                w_color = "red"
+                w_icon = "❄️"
+            else: 
+                w_color = "gray"
+                w_icon = "☁️"
+                
+            st.info(f"### {w_icon} Global Market Weather: {w_status} ({w_score:.1f}/100)")
+        if st.sidebar.button("Refresh Data"):
+            st.rerun()
+
+        # --- BATCH PRE-FETCH ---
+        # Collect all tickers needed for this view
+        
+        # 1. Favorites
         liked_stocks = tracker.get_liked_stocks()
+        
+        all_tickers = []
+        if liked_stocks:
+             all_tickers.extend([f['ticker'] for f in liked_stocks])
+        
+        # 2. Rising
+        rising_stocks = tracker.get_rising_pressure_stocks(limit=12) # Fetch list early for batching
+        if rising_stocks:
+             all_tickers.extend([f['ticker'] for f in rising_stocks])
+             
+        all_tickers = list(set(all_tickers)) # Unique
+        
+        # Fetch ALL data in one go
+        batch_data = {}
+        if all_tickers:
+             batch_data = fetcher.fetch_batch_ohlcv(all_tickers, period="2y")
+
+        # --- EXPLICIT FAVORITES (LIKED) ---
+        
+        # liked_stocks already fetched above
         
         if liked_stocks:
             st.subheader("❤️ Favorite Stocks")
             st.caption("Your personally liked stocks.")
             
             l_cols = st.columns(4)
-            for idx, fav in enumerate(liked_stocks):
-                with l_cols[idx % 4]:
-                    with st.container():
-                        st.markdown(f"**{fav['ticker']}**")
-                        
-                        score = fav['pressure_score']
-                        diff = fav['rising_diff']
-                        diff_str = f"{diff:+.1f}"
-                        
-                        st.metric("Pressure", f"{score:.1f}", diff_str, help="**Pressure Score Guide**\n\n- **High (>70):** Strong Buy / Momentum. Price likely > SMA50.\n- **Neutral (40-70):** Hold / Consolidating.\n- **Low (<40):** Sell / Weakness. Price likely < SMA200.\n\n*Relates to SMA50 vs SMA200 trend strength.*")
-                        
-                        # Market Beat Check
-                        beat_market_html = "&nbsp;"
-                        try:
-                            from src.analytics.market_comparison import calculate_market_alpha
-                            alpha = calculate_market_alpha(fav['ticker'])
-                            if alpha > 0:
-                                beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
-                            else:
-                                beat_market_html = f'<span style="font-size: 0.8em; color: red">📉 Losing to Market ({alpha:.1%})</span>'
-                        except Exception:
-                            pass
-                        st.markdown(beat_market_html, unsafe_allow_html=True)
+            with Timer("Render:Favorites"):
+                for idx, fav in enumerate(liked_stocks):
+                    ticker = fav['ticker']
+                    # Look up pre-fetched data
+                    df = batch_data.get(ticker, pd.DataFrame())
+                    
+                    with l_cols[idx % 4]:
+                        with st.container():
+                            st.markdown(f"**{ticker}**")
+                            
+                            score = fav['pressure_score']
+                            diff = fav['rising_diff']
+                            diff_str = f"{diff:+.1f}"
+                            
+                            st.metric("Pressure", f"{score:.1f}", diff_str, help="**Pressure Score Guide**\n\n- **High (>70):** Strong Buy / Momentum. Price likely > SMA50.\n- **Neutral (40-70):** Hold / Consolidating.\n- **Low (<40):** Sell / Weakness. Price likely < SMA200.\n\n*Relates to SMA50 vs SMA200 trend strength.*")
+                            
+                            # Market Beat Check
+                            beat_market_html = "&nbsp;"
+                            try:
+                                with Timer(f"API:Alpha:{fav['ticker']}"):
+                                    from src.analytics.market_comparison import calculate_market_alpha
+                                    alpha = calculate_market_alpha(fav['ticker'])
+                                if alpha > 0:
+                                    beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
+                                else:
+                                    beat_market_html = f'<span style="font-size: 0.8em; color: red">📉 Losing to Market ({alpha:.1%})</span>'
+                            except Exception:
+                                pass
+                            st.markdown(beat_market_html, unsafe_allow_html=True)
 
-                        # P/E Ratio
-                        fund = fetcher.get_fundamentals(fav['ticker'])
-                        pe = fund.get('pe_ratio', 0)
-                        pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
-                        st.caption(pe_str)
+                            # P/E Ratio
+                            with Timer(f"API:Fundamentals:{fav['ticker']}"):
+                                fund = get_cached_fundamentals(fav['ticker'])
+                            pe = fund.get('pe_ratio', 0)
+                            pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
+                            st.caption(pe_str)
 
-                        st.button("Analysis", 
-                                  key=f"liked_{fav['ticker']}",
-                                  on_click=navigate_to_analysis,
-                                  args=(fav['ticker'],))
-                    st.divider()
+                            st.button("Analysis", 
+                                      key=f"liked_{fav['ticker']}",
+                                      on_click=navigate_to_analysis,
+                                      args=(fav['ticker'],))
+                        st.divider()
         
         # --- RISING PRESSURE (Activity Based) ---
-        rising_stocks = tracker.get_rising_pressure_stocks(limit=12)
+        # rising_stocks fetched early for batching
         
         if rising_stocks:
             st.subheader("📈 Rising Stock Pressure")
@@ -121,41 +194,48 @@ def main():
             
             # Grid layout
             f_cols = st.columns(4)
-            for idx, fav in enumerate(rising_stocks):
-                with f_cols[idx % 4]:
-                    with st.container():
-                        st.markdown(f"**{fav['ticker']}**")
-                        
-                        # Score formatting
-                        score = fav['pressure_score']
-                        diff = fav['rising_diff']
-                        diff_str = f"{diff:+.1f}"
-                        
-                        st.metric("Pressure", f"{score:.1f}", diff_str, help="**Pressure Score Guide**\n\n- **High (>70):** Strong Buy / Momentum. Price likely > SMA50.\n- **Neutral (40-70):** Hold / Consolidating.\n- **Low (<40):** Sell / Weakness. Price likely < SMA200.\n\n*Relates to SMA50 vs SMA200 trend strength.*")
-                        
-                        # Market Beat Check
-                        beat_market_html = "&nbsp;"
-                        try:
-                            from src.analytics.market_comparison import calculate_market_alpha
-                            alpha = calculate_market_alpha(fav['ticker'])
-                            if alpha > 0:
-                                beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
-                            else:
-                                beat_market_html = f'<span style="font-size: 0.8em; color: red">📉 Losing to Market ({alpha:.1%})</span>'
-                        except Exception:
-                            pass
-                        st.markdown(beat_market_html, unsafe_allow_html=True)
+            with Timer("Render:Rising"):
+                for idx, fav in enumerate(rising_stocks):
+                    ticker = fav['ticker']
+                    # Look up pre-fetched data
+                    df = batch_data.get(ticker, pd.DataFrame())
+                    
+                    with f_cols[idx % 4]:
+                        with st.container():
+                            st.markdown(f"**{ticker}**")
+                            
+                            score = fav['pressure_score']
+                            diff = fav['rising_diff']
+                            diff_str = f"{diff:+.1f}"
+                            
+                            st.metric("Pressure", f"{score:.1f}", diff_str, help="**Pressure Score Guide**\n\n- **High (>70):** Strong Buy / Momentum. Price likely > SMA50.\n- **Neutral (40-70):** Hold / Consolidating.\n- **Low (<40):** Sell / Weakness. Price likely < SMA200.\n\n*Relates to SMA50 vs SMA200 trend strength.*")
 
-                        # P/E Ratio
-                        fund = fetcher.get_fundamentals(fav['ticker'])
-                        pe = fund.get('pe_ratio', 0)
-                        pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
-                        st.caption(pe_str)
-                        
-                        st.button("Analysis", 
-                                  key=f"rise_{fav['ticker']}",
-                                  on_click=navigate_to_analysis,
-                                  args=(fav['ticker'],))
+                            # Market Beat Check
+                            beat_market_html = "&nbsp;"
+                            try:
+                                with Timer(f"API:Alpha:{ticker}"):
+                                    from src.analytics.market_comparison import calculate_market_alpha
+                                    alpha = calculate_market_alpha(ticker)
+                                if alpha > 0:
+                                    beat_market_html = f'<span style="font-size: 0.8em; color: green">🚀 Beating Market (+{alpha:.1%})</span>'
+                                else:
+                                    beat_market_html = f'<span style="font-size: 0.8em; color: red">📉 Losing to Market ({alpha:.1%})</span>'
+                            except Exception:
+                                pass
+                            st.markdown(beat_market_html, unsafe_allow_html=True)
+    
+                            # P/E Ratio
+                            with Timer(f"API:Fundamentals:{ticker}"):
+                                fund = get_cached_fundamentals(ticker)
+                            pe = fund.get('pe_ratio', 0)
+                            pe_str = f"P/E: {pe:.1f}" if pe > 0 else "P/E: N/A"
+                            st.caption(pe_str)
+                            
+                            st.button("Analysis", 
+                                      key=f"rise_{ticker}",
+                                      on_click=navigate_to_analysis,
+                                      args=(ticker,))
+                        st.divider()
 
                     st.divider()
         else:
@@ -175,43 +255,66 @@ def main():
                 from src.data.ingestion import DataFetcher
                 from src.analytics.risk import calculate_risk_metrics
                 from src.ui.components import render_risk_gauge
-                import pandas as pd
+
                 
                 fetcher = DataFetcher()
                 
                 st.subheader("Active Portfolio Risk Assessment")
                 
+                # BATCH FETCH for Portfolios
+                all_p_tickers = []
+                for p in live_portfolios:
+                    all_p_tickers.extend(list(p.holdings.keys()))
+                all_p_tickers = list(set(all_p_tickers))
+                
+                p_batch_data = {}
+                if all_p_tickers:
+                    # Risk calc uses 1y data usually
+                    p_batch_data = fetcher.fetch_batch_ohlcv(all_p_tickers, period="1y")
+
                 cols = st.columns(len(live_portfolios))
                 
                 for idx, p in enumerate(live_portfolios):
-                    with cols[idx % 3]: # Wrap every 3
-                        st.markdown(f"### {p.name}")
-                        
-                        if not p.holdings:
-                            st.warning("No holdings to analyze.")
-                            continue
+                               # Use batch data logic to assemble a dict of {ticker: df} for this portfolio
+                            port_dfs = {}
+                            missing_tickers = []
                             
-                        # Calculate Pro-Forma Historical Value
-                        # Fetch 1y data for all assets
-                        portfolio_series = pd.Series(dtype=float)
-                        
-                        with st.spinner(f"Analyzing {p.name}..."):
+                            # Original Loop was iterating keys only in my bad refactor
+                            # We need both for the logic below, but first let's just assemble the DFs
+                            for t in p.holdings.keys():
+                                if t in p_batch_data:
+                                    port_dfs[t] = p_batch_data[t]
+                                else:
+                                    missing_tickers.append(t)
+                            
+                            # Fallback for missing
+                            if missing_tickers:
+                                for t in missing_tickers:
+                                     port_dfs[t] = fetcher.fetch_ohlcv(t, period="1y")
+
+                            if not port_dfs:
+                                st.warning("No data.")
+                                continue
+
+                            # Calculate Pro-Forma Historical Value
+                            portfolio_series = pd.Series(dtype=float)
                             valid_data = True
+                            
+                            # NOW we iterate items to get qty for value calculation
                             for ticker, qty in p.holdings.items():
-                                df = fetcher.fetch_ohlcv(ticker, period="1y")
-                                if df.empty:
+                                df = port_dfs.get(ticker)
+                                
+                                if df is None or df.empty:
+                                    # specific logic if one ticker is missing from the batch source for some reason
                                     st.error(f"Could not fetch data for {ticker}")
                                     valid_data = False
                                     break
                                 
-                                # Align to common index? For MVP assume mostly overlapping '1y'
                                 # Multiply close by qty
                                 val_series = df['close'] * qty
                                 
                                 if portfolio_series.empty:
                                     portfolio_series = val_series
-                                else:
-                                    # Add to total, align index
                                     portfolio_series = portfolio_series.add(val_series, fill_value=0)
                             
                             if valid_data and not portfolio_series.empty:
@@ -223,16 +326,12 @@ def main():
                                 vol = metrics.get("Volatility_Ann", 0.0)
                                 
                                 # Convert Volatility to Safety Score (0-100)
-                                # Assumption: 0% vol = 100 Score, 50% vol = 0 Score
-                                # Score = 100 * (1 - (vol / 0.5))
                                 safety_score = max(0.0, min(100.0, 100 * (1 - (vol / 0.4))))
                                 
                                 # Render Gauge
                                 st.plotly_chart(render_risk_gauge(safety_score / 100, f"Safety Score: {safety_score:.0f}/100"), use_container_width=True)
                                 
                                 st.caption(f"Annualized Volatility: {vol:.1%}")
-                                
-                                # Interpretation
                                 if safety_score > 80:
                                     st.success("**Insight:** High Safety (Conservative).")
                                 elif safety_score > 50:

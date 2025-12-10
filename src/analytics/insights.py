@@ -75,12 +75,19 @@ class InsightManager:
                         delta = (today - datetime.strptime(db_date, "%Y-%m-%d")).days
                     else:
                         delta = (today.date() - db_date).days
+                    
+                    print(f"🧐 InsightManager Debug: Found {report_type} for {ticker} from {db_date}. Delta={delta}, Valid={valid_days}")
                         
                     if delta < valid_days:
+                        print("✅ InsightManager: Cache Hit!")
                         return content
+                    else:
+                        print("❌ InsightManager: Cache Expired.")
+                else:
+                    print(f"❌ InsightManager: No cache found for {ticker} type={report_type}")
                 return None
             except Exception as e:
-                print(f"DB Read Error: {e}")
+                print(f"DB Read Error in InsightManager: {e}")
                 return None
 
         # --- JSON Fallback ---

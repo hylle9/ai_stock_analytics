@@ -1,11 +1,13 @@
 import pandas as pd
 from src.data.ingestion import DataFetcher
+import streamlit as st
 from src.analytics.technical import add_technical_features
 
-def calculate_market_alpha(ticker: str, period: str = "1y") -> float:
+@st.cache_data(ttl=3600)
+def calculate_market_alpha(ticker: str, benchmark_ticker: str = "SPY", period: str = "1y") -> float:
     """
-    Calculates the SMA50 Alpha (Stock Growth - Market Growth) for a given ticker
-    over the specified period.
+    Calculates Alpha (Excess Return vs Benchmark) over the period.
+    Simple Metric: (Ticker Return - Benchmark Return).
     Returns 0.0 if data is insufficient.
     """
     fetcher = DataFetcher()

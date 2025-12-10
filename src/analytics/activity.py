@@ -20,9 +20,18 @@ class ActivityTracker:
         }
         if Config.USE_SYNTHETIC_DB:
              from src.data.db_manager import DBManager
-             self.db = DBManager()
+             # Try to init normally first
+             try:
+                 self.db = DBManager(read_only=False)
+                 self.read_only = False
+             except Exception:
+                 # If locked, fallback to read-only
+                 print("⚠️ ActivityTracker: DB Locked. Switching to Read-Only.")
+                 self.db = DBManager(read_only=True)
+                 self.read_only = True
         else:
              self.db = None
+             self.read_only = False
         
         if not Config.USE_SYNTHETIC_DB:
             self._load_data()
@@ -58,6 +67,10 @@ class ActivityTracker:
 
     def toggle_like(self, ticker: str):
         """Toggles the liked state of a ticker."""
+        if self.read_only:
+            print("⚠️ Read-Only Mode: Cannot toggle like.")
+            return
+
         if Config.USE_SYNTHETIC_DB and self.db:
             con = self.db.get_connection()
             try:
@@ -102,25 +115,34 @@ class ActivityTracker:
             try:
                 likes = con.execute("SELECT ticker FROM fact_user_interactions WHERE interaction_type='LIKE'").fetchall()
                 for (t,) in likes:
-                    # Fetch latest score from VIEW history
-                    score_res = con.execute("""
+                    # Fetch last 5 VIEW interactions for score history
+                    scores_res = con.execute("""
                         SELECT metadata 
                         FROM fact_user_interactions 
                         WHERE ticker=? AND interaction_type='VIEW' 
-                        ORDER BY timestamp DESC LIMIT 1
-                    """, (t,)).fetchone()
+                        ORDER BY timestamp DESC LIMIT 5
+                    """, (t,)).fetchall()
                     
-                    score = 0.0
-                    if score_res:
+                    history_scores = []
+                    for row in scores_res:
                         try:
-                            # DuckDB JSON might return string or object depending on driver version
-                            s_data = score_res[0]
+                            s_data = row[0]
                             if isinstance(s_data, str):
                                 meta = json.loads(s_data)
-                                score = meta.get("score", 0.0)
+                                history_scores.append(meta.get("score", 0.0))
                         except: pass
-                        
-                    results.append({"ticker": t, "pressure_score": score, "rising_diff": 0.0})
+                    
+                    current_score = history_scores[0] if history_scores else 0.0
+                    
+                    # Calculate Trend Diff (Current - Avg of prev 3)
+                    diff = 0.0
+                    if len(history_scores) > 1:
+                        prev_window = history_scores[1:4] # Up to 3 previous
+                        if prev_window:
+                            avg_prev = sum(prev_window) / len(prev_window)
+                            diff = current_score - avg_prev
+                            
+                    results.append({"ticker": t, "pressure_score": current_score, "rising_diff": diff})
             except Exception as e:
                 print(f"DB Get Likes Error: {e}")
             finally:
@@ -163,6 +185,8 @@ class ActivityTracker:
         return current_score - avg_prev
 
     def log_view(self, ticker: str, pressure_score: float):
+        if self.read_only: return
+
         if Config.USE_SYNTHETIC_DB and self.db:
             con = self.db.get_connection()
             try:
@@ -215,19 +239,36 @@ class ActivityTracker:
                 
                 results = []
                 for (t, v) in rows:
-                    # Get score
-                    score_res = con.execute("""
+                    # Get history scores
+                    scores_res = con.execute("""
                         SELECT metadata FROM fact_user_interactions 
                         WHERE ticker=? AND interaction_type='VIEW' 
-                        ORDER BY timestamp DESC LIMIT 1
-                    """, (t,)).fetchone()
-                    score = 0.0
-                    if score_res:
+                        ORDER BY timestamp DESC LIMIT 5
+                    """, (t,)).fetchall()
+                    
+                    history_scores = []
+                    for row in scores_res:
                         try:
-                             meta = json.loads(score_res[0])
-                             score = meta.get("score", 0.0)
+                             s_data = row[0]
+                             if isinstance(s_data, str):
+                                 meta = json.loads(s_data)
+                                 history_scores.append(meta.get("score", 0.0))
                         except: pass
-                    results.append({"ticker": t, "pressure_score": score, "rising_diff": 0.0})
+
+                    current_score = history_scores[0] if history_scores else 0.0
+                    
+                    # Diff
+                    diff = 0.0
+                    if len(history_scores) > 1:
+                        prev_window = history_scores[1:4]
+                        if prev_window:
+                            avg_prev = sum(prev_window) / len(prev_window)
+                            diff = current_score - avg_prev
+                            
+                    results.append({"ticker": t, "pressure_score": current_score, "rising_diff": diff})
+                
+                # Sort by Momentum (Descending)
+                results.sort(key=lambda x: x["rising_diff"], reverse=True)
                 return results
             except Exception as e:
                 print(f"DB Rising Stocks Error: {e}")
@@ -264,3 +305,80 @@ class ActivityTracker:
             })
         results.sort(key=lambda x: x["rising_diff"], reverse=True)
         return results[:limit]
+    def update_ticker_metadata(self, ticker: str, metadata: dict):
+        """
+        Updates metadata (e.g. pressure score) for a ticker.
+        """
+        if self.read_only: return
+
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                 import uuid
+                 # We treat this as a 'SYSTEM_UPDATE' or a special VIEW to persist score
+                 iid = str(uuid.uuid4())
+                 meta_json = json.dumps(metadata)
+                 
+                 con.execute("INSERT OR IGNORE INTO dim_assets (ticker) VALUES (?)", (ticker,))
+                 con.execute("""
+                    INSERT INTO fact_user_interactions (interaction_id, ticker, interaction_type, metadata)
+                    VALUES (?, ?, 'VIEW', ?)
+                 """, (iid, ticker, meta_json))
+            except Exception as e:
+                print(f"DB Metadata Update Error: {e}")
+            finally:
+                con.close()
+            return
+
+        # Simple JSON update
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today not in self.data["history"]: self.data["history"][today] = {}
+        
+        if ticker not in self.data["history"][today]:
+             self.data["history"][today][ticker] = {"views": 0, "score": 0.0}
+             
+        if "score" in metadata:
+            self.data["history"][today][ticker]["score"] = float(metadata["score"])
+        
+        self._save_data()
+
+    def get_market_weather(self) -> dict:
+        """
+        Retrieves the global market weather status.
+        Returns dict with keys: score, status, last_updated.
+        """
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                # Retrieve from VIEW interaction for '$MARKET'
+                res = con.execute("""
+                    SELECT metadata 
+                    FROM fact_user_interactions 
+                    WHERE ticker='$MARKET' AND interaction_type='VIEW' 
+                    ORDER BY timestamp DESC LIMIT 1
+                """).fetchone()
+                
+                if res:
+                    try:
+                        return json.loads(res[0])
+                    except: pass
+            except Exception as e:
+                print(f"DB Market Weather Error: {e}")
+            finally:
+                con.close()
+            return {}
+
+        # JSON Fallback
+        today = datetime.now().strftime("%Y-%m-%d")
+        history = self.data["history"]
+        if today in history and "$MARKET" in history[today]:
+            entry = history[today]["$MARKET"]
+            # Reconstruct extra fields if stored in 'score' only?
+            # DCS stores full dict in set_metadata, but JSON implementation 
+            # in update_ticker_metadata only saved 'score' to 'score' field.
+            # We need to check if update_ticker_metadata handles arbitrary keys for JSON.
+            # Looking at code: it only saves 'score'. 
+            # Let's adjust JSON return to be consistent if possible, or accept just score.
+            return {"score": entry.get("score", 50.0), "status": "UNKNOWN"}
+            
+        return {}

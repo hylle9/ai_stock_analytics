@@ -12,6 +12,7 @@ plotly
 requests
 scipy
 duckdb
+db-dtypes
 ta
 google-generativeai
 tabulate

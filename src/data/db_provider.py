@@ -8,8 +8,8 @@ class DuckDBProvider(BaseDataProvider):
     Data Provider that reads from the local DuckDB instance.
     Used for 'Synthetic Mode'.
     """
-    def __init__(self):
-        self.db = DBManager()
+    def __init__(self, read_only: bool = False):
+        self.db = DBManager(read_only=read_only)
     
     def fetch_ohlcv(self, ticker: str, period: str = "2y") -> pd.DataFrame:
         """
@@ -163,18 +163,18 @@ class DuckDBProvider(BaseDataProvider):
         try:
             self.add_asset(ticker)
             d = date_obj.strftime('%Y-%m-%d') if hasattr(date_obj, 'strftime') else date_obj
-            con.execute("INSERT OR REPLACE INTO fact_alt_data (ticker, date, sentiment_score, web_attention, source) VALUES (?, ?, ?, ?, ?)", 
-                       (ticker, d, sentiment, attention, source))
+            con.execute("INSERT OR REPLACE INTO fact_alt_data (ticker, date, sentiment_score, web_attention) VALUES (?, ?, ?, ?)", 
+                       (ticker, d, sentiment, attention))
         except Exception as e:
             print(f"DB Save Error (Alt): {e}")
         finally:
             con.close()
 
     def fetch_alt_history(self, ticker: str, days: int = 30) -> pd.DataFrame:
-        con = self.get_connection()
+        con = self.db.get_connection()
         try:
             query = """
-                SELECT date, sentiment_score, web_attention, source 
+                SELECT date, sentiment_score, web_attention
                 FROM fact_alt_data 
                 WHERE ticker = ? 
                 ORDER BY date DESC
@@ -230,8 +230,27 @@ class DuckDBProvider(BaseDataProvider):
             return {}
         finally:
             con.close()
+            
+    def get_latest_dates_map(self) -> dict:
+        """
+        Returns a dict of {ticker: max_date_str} for all assets.
+        Efficient batch query.
+        """
+        con = self.db.get_connection()
+        try:
+            query = "SELECT ticker, MAX(date) as mx FROM fact_market_data GROUP BY ticker"
+            df = con.execute(query).fetchdf()
+            if df.empty: return {}
+            # Convert to dict {ticker: 'YYYY-MM-DD'}
+            # Ensure date is string
+            return dict(zip(df['ticker'], df['mx'].astype(str)))
+        except Exception as e:
+            print(f"Error fetching latest dates map: {e}")
+            return {}
+        finally:
+            con.close()
 
-    def save_ohlcv(self, ticker: str, df: pd.DataFrame):
+    def save_ohlcv(self, ticker: str, df: pd.DataFrame, source: str = "synthetic"):
         """
         Upsert OHLCV data into fact_market_data.
         """
@@ -256,14 +275,13 @@ class DuckDBProvider(BaseDataProvider):
                     float(row.get('high', 0)), 
                     float(row.get('low', 0)), 
                     float(row.get('close', 0)), 
-                    int(row.get('volume', 0)),
-                    source
+                    int(row.get('volume', 0))
                 ))
             
             # Upsert
             con.executemany("""
-                INSERT OR REPLACE INTO fact_market_data (ticker, date, open, high, low, close, volume, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO fact_market_data (ticker, date, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, records)
             
         except Exception as e:
@@ -284,7 +302,7 @@ class DuckDBProvider(BaseDataProvider):
             # Dynamic start date relative to available data
             # This ensures '1y' means 'Last 1 year of data' not 'Today - 1 year' (in case of synthetic future data)
             query = f"""
-                SELECT date, open, high, low, close, volume, source
+                SELECT date, open, high, low, close, volume
                 FROM fact_market_data 
                 WHERE ticker = ? 
                 AND date >= (SELECT MAX(date) - INTERVAL '{period_sql}' FROM fact_market_data WHERE ticker = ?)
@@ -338,3 +356,89 @@ class DuckDBProvider(BaseDataProvider):
                         (ticker, name or ticker, sector or "Unknown", industry or "Unknown"))
          finally:
              con.close()
+
+    def fetch_batch_ohlcv(self, tickers: list[str], period: str = "2y") -> dict:
+        """
+        Efficiently fetch data for multiple tickers in ONE query.
+        Returns: {ticker: pd.DataFrame}
+        """
+        if not tickers:
+            return {}
+            
+        # Calc date
+        days_map = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 20000}
+        days = days_map.get(period, 730)
+        start_date = (pd.Timestamp.now() - pd.Timedelta(days=days)).date()
+        
+        con = self.db.get_connection()
+        try:
+            # SQL IN Clause construction
+            ticker_list_str = ", ".join([f"'{t}'" for t in tickers])
+            query = f"""
+                SELECT * FROM fact_market_data 
+                WHERE ticker IN ({ticker_list_str}) 
+                ORDER BY ticker, date ASC
+            """
+            
+            # Execute
+            big_df = con.execute(query).fetchdf()
+            
+            if big_df.empty:
+                return {}
+            
+            # Post-process: Split by ticker
+            result = {}
+            for t in tickers:
+                # Optimized filtering
+                sub_df = big_df[big_df['ticker'] == t].copy()
+                if not sub_df.empty:
+                    sub_df['date'] = pd.to_datetime(sub_df['date'])
+                    sub_df.set_index('date', inplace=True)
+                    result[t] = sub_df
+            
+            return result
+            
+            return result
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"❌ Error in batch fetch: {e}")
+            return {}
+        finally:
+            con.close()
+
+    def get_latest_date(self, ticker: str) -> str:
+        """
+        Returns the latest date (YYYY-MM-DD) available for a ticker.
+        Returns None if no data exists.
+        """
+        con = self.db.get_connection()
+        try:
+            res = con.execute("SELECT MAX(date) FROM fact_market_data WHERE ticker=?", (ticker,)).fetchone()
+            if res and res[0]:
+                # res[0] is date object
+                return res[0].strftime("%Y-%m-%d")
+            return None
+        except Exception as e:
+             print(f"DB Get Latest Date Error: {e}")
+             return None
+        finally:
+            con.close()
+
+    def get_asset_origin(self, ticker: str) -> str:
+        """
+        Returns the retrieval_origin for a ticker (e.g. 'RBRS', 'AIRS').
+        Returns 'UNKNOWN' if not found.
+        """
+        con = self.db.get_connection()
+        try:
+            res = con.execute("SELECT retrieval_origin FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+            if res and res[0]:
+                return res[0]
+            return "UNKNOWN"
+        except Exception as e:
+            # print(f"DB Get Origin Error: {e}")
+            return "UNKNOWN"
+        finally:
+            con.close()

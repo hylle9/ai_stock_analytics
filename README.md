@@ -9,80 +9,97 @@
 
 ## 🚀 Project Overview
 
-**AI Stock Analytics (ASA)** is an advanced market analysis platform composed of a "Fusion Engine" that combines traditional technical indicators with alternative data streams and Large Language Model (LLM) reasoning.
+**AI Stock Analytics (ASA)** is an advanced market analysis platform designed to bridge the gap between retail trading tools and institutional-grade intelligence. At its core is the **"Fusion Engine"**, a sophisticated system that synthesizes multi-modal data streams into actionable insights.
 
-Unlike simple chart wrappers, **ASA** treats the market as a complex system, analyzing:
-1.  **Price Action:** Technical momentum and trend stability.
-2.  **Market Psychology:** Social sentiment and web search volume intensity.
-3.  **Fundamental Valuation:** P/E ratios and market cap context.
-4.  **Macro Context:** Returns relative to the broader market (Alpha).
+Unlike simple chart wrappers or basic screeners, **ASA** treats the market as a complex adaptive system, analyzing it through four distinct lenses:
+1.  **Price Action (Technical)**: Momentum, trend stability, and volatility energy.
+2.  **Market Psychology (Sentiment)**: Real-time social sentiment and web search intensity.
+3.  **Fundamental Context (Valuation)**: P/E ratios, earnings context, and sector benchmarking.
+4.  **Macro Alpha (Relative Performance)**: Measuring performance against the broader market (S&P 500) to isolate idiosyncratic strength.
 
-The system aggregates these signals into a unified **"Pressure Score"** (0-100), helping you identify high-probability opportunities where retail enthusiasm meets technical strength.
+The system aggregates these disparate signals into a unified **"Pressure Score"** (0-100), a single metric that helps you identify high-probability opportunities where retail enthusiasm aligns with technical strength and fundamental safety.
 
-⚠️ **Status**: Pre-Alpha / Active Development.
+> **Current Status**: Pre-Alpha / Active Development
 
 ---
 
 ## ✨ Key Features
 
 ### 🧠 1. Deep Research Agent (Gemini Powered)
-Go beyond simple numbers with our integrated AI Analyst.
-*   **Deep Dives**: On-demand generation of comprehensive research reports using **Google Gemini Pro**.
-*   **Smart Caching**: "Weekly Research" reports are cached for 7 days to prevent analysis fatigue and API rate limits.
-*   **Multi-Modal Context**: The AI sees what you see—analysis is grounded in the exact RSI, Sentiment, and Volatility metrics currently displayed.
+Go beyond simple numbers with our integrated **AI Analyst**.
+*   **On-Demand Intelligence**: Generates comprehensive research reports using **Google Gemini Pro**.
+*   **Context-Aware**: The AI "sees" the exact metrics you are looking at (RSI, Volatility, Sentiment) to provide grounded analysis.
+*   **Smart Caching**: "Weekly Research" reports are cached for 7 days to prevent analysis fatigue and conserve API quotas.
+*   **Strategic Outlook**: Provides clear "Bull Case", "Bear Case", and "Execution Strategy" sections.
 
-### ⚡ 2. The "Fusion Engine" & Pressure Score
-Our proprietary scoring system quantifies the directional energy of a stock:
+### ⚡ 2. Sub-Second Performance Architecture
+We have engineered a high-performance data pipeline to ensure instant decision making:
+*   **Consolidated Caching**: A unified data loader bundles Price, News, Fundamentals, and AI into a single transaction with a 1-hour TTL.
+*   **Parallel Processing**: Peer benchmarks and competitor data are fetched in parallel batches, reducing load times from ~20s to <0.5s.
+*   **Smart Persistence**: `DuckDB` based storage ensures data survives restarts, with automatic schema migrations to keep your database healthy.
+
+### 📈 3. "Golden Cross" & Technical Visualization
+*   **Golden Cross Indicators**: Automatically detects and visualizes the "Golden Cross" (SMA50 > SMA200) and "Death Cross" events.
+*   **Trend Confirmation**: Color-coded crossover markers directly on the price chart.
+*   **Contextual Scaling**: Benchmark (S&P 500) comparison is visually scaled to the stock's starting price for accurate relative performance tracking.
+
+### 💎 4. The "Fusion Engine" & Pressure Score
+Our proprietary scoring system quantifies the directional energy of a stock. It is not just a technical indicator; it is a composite signal of market intent.
+
+**Composition (Hybrid Model):**
 *   **Price Trend (30%)**: Normalized momentum (RSI, ROC, SMA Deviations).
 *   **Volatility Energy (20%)**: Measures latent kinetic energy (Bollinger Band compression).
-*   **Social Sentiment (25%)**: Real-time news sentiment and social signal proxy.
-*   **Web Attention (25%)**: Viral intensity tracking (Search/Social volume).
+*   **Hybrid Retail Score (50%)**: A robust combination of:
+    *   **Social Sentiment**: Real-time social chatter (StockTwits).
+    *   **Volume Anomalies**: Spike detection (> 20-day avg).
+    *   **Volume Acceleration**: 3-day rate-of-change.
 
-**Pressure Score Interpretation**:
-*   🟢 **> 70**: High Momentum (Strong Buy zone if not overextended).
-*   🟡 **40-70**: Neutral / Consolidation.
-*   🔴 **< 40**: Weakness (Sell / Avoid zone).
+**Pressure Score Guide:**
+*   🟢 **> 70 (High Momentum)**: Strong Buy zone. Price is likely trending above SMA50 with high social volume.
+*   🟡 **40-70 (Neutral)**: Consolidation / Holding pattern.
+*   🔴 **< 40 (Weakness)**: Sell / Avoid zone. Price is likely below SMA200 with negative sentiment.
 
-### 📊 3. Advanced Dashboarding
-*   **Market Beat Alpha**: Instantly see if a stock is outperforming the S&P 500 (displayed as "🚀 Beating Market" or "📉 Losing to Market").
-*   **Valuation Context**: P/E Ratios integrated directly into stock cards.
-*   **Activity Tracking**: "Favorites" and "Rising Stocks" lists auto-populate based on your interaction history.
+### ⚙️ 3. Execution Modes
+The application supports multiple execution modes to suit your development or trading needs:
+*   **Production Mode (`--production`)**: Strict live data enforcement. No mock data. intended for actual decision making.
+*   **Live Mode (`--live`)**: Prioritizes API data but may fallback if limits are reached.
+*   **Synthetic Mode (`--synthetic`)**: Uses local database or synthetic patterns. Ideal for UI testing and development without burning API credits.
 
 ### 🛡️ 4. Portfolio & Risk Management
-*   **Multi-Portfolio Support**: Create distinct portfolios (e.g., "Long Term Growth", "Speculative").
-*   **Risk Dashboard**: Visualize the volatility and VaR (Value at Risk) of your holdings vs. the broader universe.
-*   **Holdings Analysis**: Aggregate performance tracking and safety scoring.
+*   **Multi-Portfolio Architecture**: Manage distinct strategies (e.g., "Long Term Growth", "Speculative", "Income").
+*   **Risk Dashboard**: Visualizes volatility and VaR (Value at Risk) to ensure you aren't overexposed.
+*   **Holdings Analysis**: Aggregate performance tracking and safety scoring based on historical volatility.
 
 ---
 
 ## 🏗 System Architecture
 
-The project follows a Domain-Driven Design (DDD) with a clean separation between data ingestion, analytical logic, and presentation.
+The project follows a **Domain-Driven Design (DDD)** approach, ensuring separation of concerns between data fetching, business logic, and presentation.
 
 ```text
 ai_stock_analytics/
-├── data/                   # Persistent storage (Parquet/JSON caches)
+├── data/                   # Persistent storage (DuckDB / Parquet)
 ├── src/
 │   ├── analytics/          # The "Brain" of the system
 │   │   ├── fusion.py       # Pressure Score algorithms
 │   │   ├── gemini_analyst.py # AI Agent integration
-│   │   ├── risk.py         # VaR/CVaR calculations
-│   │   └── sentiment.py    # NLP engines
+│   │   └── risk.py         # VaR/CVaR calculations
 │   ├── data/               # Data Infrastructure
 │   │   ├── ingestion.py    # Robust fetching with Fallback logic
 │   │   └── providers.py    # AlphaVantage / YFinance implementations
 │   ├── models/             # Core Entities (Portfolio, Position)
-│   └── ui/                 # Streamlit Frontend
-│       ├── app.py          # Main entry point
-│       └── views/          # Modular view components
+│   ├── ui/                 # Streamlit Frontend
+│   │   ├── app.py          # Main entry point
+│   │   └── views/          # Modular view components
+│   └── utils/              # Configuration & Helpers
 └── tests/                  # Integrity verification
 ```
 
 ### Robust Data Pipeline
-The system uses a **Resilient Provider Pattern**:
+The system implements a **Resilient Provider Pattern**:
 1.  **Primary**: Alpha Vantage (Institutional quality data).
-2.  **Fallback**: Yahoo Finance (Automatic failover if API keys missing/exhausted).
-3.  **Caching**: Aggressive local caching prevents API throttling and ensures instant UI loads.
+2.  **Fallback**: Yahoo Finance (Automatic failover if API keys missing or limits exhausted).
+3.  **Caching**: Aggressive local caching (file-based) prevents API throttling and ensures instant UI loads.
 
 ---
 
@@ -90,8 +107,8 @@ The system uses a **Resilient Provider Pattern**:
 
 ### Prerequisites
 *   **Python 3.10+** (Recommended)
-*   **Google Gemini API Key** (for Deep Research)
-*   **Alpha Vantage API Key** (Optional, for premium data)
+*   **Google Gemini API Key** (Required for Deep Research)
+*   **Alpha Vantage API Key** (Recommended for best data quality)
 
 ### 1. Clone & Install
 ```bash
@@ -99,7 +116,7 @@ git clone https://github.com/hylle9/ai_stock_analytics.git
 cd ai_stock_analytics
 
 # Create Virtual Environment
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install Dependencies
@@ -112,53 +129,65 @@ Create a `.env` file in the root directory:
 touch .env
 ```
 
-Add your keys:
+Add your configuration (see `src/utils/config.py` for all options):
 ```ini
+# --- API KEYS ---
 # Required for AI Features
 GOOGLE_API_KEY=your_gemini_key_here
 
 # Recommended for Best Data Quality
 ALPHA_VANTAGE_API_KEY=your_av_key_here
 
-# App Settings
+# --- APP CONFIGURATION ---
+# Feature Flags
+ENABLE_REAL_SENTIMENT=True
+USE_MOCK_DATA=False
+
+# Data Settings
 DATA_CACHE_DIR=data
+MAX_RETRIES=3
 ```
 
 ### 3. Run the Application
-```bash
-# Run using the startup script wrapper (recommended)
-python main.py
+The application can be run in different modes depending on your intent.
 
-# OR directly via Streamlit
-streamlit run src/ui/app.py
+**Production Mode (Recommended for Usage):**
+```bash
+# Terminal 1: Run the UI
+streamlit run src/ui/app.py -- --production
+
+# Terminal 2: Run the Data Collect Server (Background Updates)
+python -m src.dcs.main
 ```
+*Enforces strict live data usage and disables development shortcuts.*
+
+**Standard/Live Mode:**
+```bash
+streamlit run src/ui/app.py -- --live
+```
+
+**Development/Synthetic Mode:**
+```bash
+streamlit run src/ui/app.py -- --synthetic
+```
+
 *Access the dashboard at `http://localhost:8501`*
 
 ---
 
 ## 📖 Usage Guide
 
-### The Workflow
-1.  **Dashboard**: Start here. Check your **"Rising Stocks"** to see what's moving today. Look for green "Beating Market" badges.
-2.  **Analysis**: Click "Analysis" on any card.
+### The Daily Workflow
+1.  **Dashboard Scan**: Start with the **"Rising Stocks"** or **"Favorites"** panels. Look for the "Beating Market" badge.
+2.  **Deep Dive Analysis**: Click "Analysis" on any stock card.
     *   Review the **P/E Ratio** and **Signal Components**.
     *   Check specific metrics like **RSI** and **News Sentiment**.
-3.  **Deep Research**: If a stock looks interesting but complex:
+3.  **AI Consultation**: If a stock looks interesting:
     *   Scroll down to "First-Class AI Insight".
     *   Click **"Run Deep Research"**.
-    *   Read the generated report on Strategy, Risks, and Outlook.
-4.  **Portfolio**: Add the stock to your "Watchlist" or "Live" portfolio to track its risk contribution.
-
----
-
-## 🔮 Roadmap
-
-*   [x] **mvp**: Core Dashboard & Analysis
-*   [x] **feat**: Gemini AI Integration (Deep Research)
-*   [x] **feat**: P/E Ratios & Fundamental Data
-*   [ ] **feat**: Automated "Morning Briefing" emails
-*   [ ] **feat**: Docker Containerization
-*   [ ] **feat**: User Authentication (Multi-tenant)
+    *   Read the generated report for a second opinion.
+4.  **Portfolio Action**: Add the stock to a "Watchlist" or "Live" portfolio.
+5.  **Risk Check**: Visit the **Risk Dashboard** to see how this new position affects your overall portfolio volatility.
 
 ---
 

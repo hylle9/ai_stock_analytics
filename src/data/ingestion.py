@@ -1,10 +1,12 @@
 import pandas as pd
 import os
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from src.utils.config import Config
 from src.data.providers import AlphaVantageProvider, BaseDataProvider, YFinanceProvider
+from src.data.providers import AlphaVantageProvider, BaseDataProvider, YFinanceProvider
 from src.data.db_provider import DuckDBProvider
+from src.utils.profiling import Timer
 
 class DataFetcher:
     """
@@ -17,6 +19,7 @@ class DataFetcher:
         
         self.db = None
         self.live_provider = None
+        self.date_cache = {}
         
         # 1. Setup DB Provider (if enabled)
         if Config.USE_SYNTHETIC_DB:
@@ -39,6 +42,13 @@ class DataFetcher:
 
     def _get_cache_path(self, ticker: str, period: str) -> str:
         return os.path.join(self.cache_dir, f"{ticker}_{period}.parquet")
+        
+    def warmup_cache(self):
+        """Pre-fetch metadata to speed up subsequent calls."""
+        if self.db:
+            with Timer("DB:WarmupDates"):
+                self.date_cache = self.db.get_latest_dates_map()
+                print(f"🔥 Cache Warmed: {len(self.date_cache)} tickers loaded.")
 
     def fetch_ohlcv(self, ticker: str, period: str = "2y", use_cache: bool = True) -> pd.DataFrame:
         """
@@ -49,8 +59,50 @@ class DataFetcher:
         Fetch daily OHLCV data based on Config.DATA_STRATEGY.
         """
         # --- STRATEGY: LIVE (API First -> Save DB -> Fallback DB) ---
-        if Config.DATA_STRATEGY == "LIVE":
-             # 1. Try Live
+        if Config.DATA_STRATEGY in ["LIVE", "PRODUCTION"]:
+             # 0. Smart Cache Optimization
+             # Even in Live Mode, if we have "Fresh" data in DB, use it.
+             if self.db:
+                 try:
+                     with Timer(f"SmartCheck::{ticker}"):
+                         # Check in-memory cache first, then fall back to DB query
+                         latest_date_str = self.date_cache.get(ticker)
+                         if not latest_date_str:
+                              latest_date_str = self.db.get_latest_date(ticker)
+                              
+                         if latest_date_str:
+                             latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d").date()
+                             today = datetime.now().date()
+                             
+                             # Simple Freshness: Is latest date >= today (or is it weekend?)
+                             is_fresh = False
+                             if latest_date >= today - timedelta(days=1):
+                                 is_fresh = True
+    
+                             if is_fresh:
+                                 print(f"✨ Smart Cache: Found fresh data for {ticker} in DB.")
+                                 with Timer(f"DBFetch::{ticker}"):
+                                     df = self.db.fetch_ohlcv(ticker, period)
+                                 
+                                 if not df.empty:
+                                     # In PRODUCTION, we trust the DB as "Real History"
+                                     is_prod = Config.DATA_STRATEGY == "PRODUCTION"
+                                     source_tag = "live" if is_prod else "🟠 CACHE (DB)"
+                                     df.attrs["source"] = source_tag
+                                     if 'source' not in df.columns: df['source'] = source_tag
+                                     return df
+                 except Exception as e:
+                     print(f"Smart Cache Error: {e}")
+
+     # 1. Try Live
+             if ticker == "$MARKET":
+                 if self.db:
+                      df = self.db.fetch_ohlcv(ticker, period)
+                      if not df.empty:
+                          df.attrs["source"] = "🟠 CACHE (DB)" 
+                          return df
+                 return pd.DataFrame()
+
              print(f"📡 Fetching live data for {ticker}...")
              try:
                  df = self.live_provider.fetch_ohlcv(ticker, period)
@@ -62,6 +114,8 @@ class DataFetcher:
                      if self.db: 
                          print(f"💾 Saving to DB...")
                          self.db.save_ohlcv(ticker, df, source="live")
+                     df.attrs["source"] = "🟢 LIVE"
+                     df['source'] = 'live'
                      return df
              except Exception as e:
                  print(f"Live Fetch Error: {e}")
@@ -69,7 +123,14 @@ class DataFetcher:
              # 2. Fallback DB
              if self.db:
                  print(f"⚠️ Live failed. Falling back to DB for {ticker}")
-                 return self.db.fetch_ohlcv(ticker, period)
+                 df = self.db.fetch_ohlcv(ticker, period)
+                 if not df.empty:
+                     # In PRODUCTION, we trust the DB as "Real History"
+                     is_prod = Config.DATA_STRATEGY == "PRODUCTION"
+                     source_tag = "live" if is_prod else "🟠 CACHE (DB)"
+                     df.attrs["source"] = source_tag
+                     if 'source' not in df.columns: df['source'] = source_tag
+                     return df
              return pd.DataFrame()
 
         # --- STRATEGY: SYNTHETIC (DB First -> Live -> Save DB) ---
@@ -78,6 +139,7 @@ class DataFetcher:
             if self.db:
                 df = self.db.fetch_ohlcv(ticker, period)
                 if not df.empty:
+                    df.attrs["source"] = "🟠 CACHE (DB)"
                     return df
             
             # 2. Fallback Live
@@ -89,6 +151,7 @@ class DataFetcher:
                 
                 if not df.empty and self.db:
                     self.db.save_ohlcv(ticker, df, source="live")
+                    df.attrs["source"] = "🟢 LIVE"
                     return df
             except Exception as e:
                 print(f"Fallback Error for {ticker}: {e}")
@@ -105,7 +168,9 @@ class DataFetcher:
                 mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
                 if mtime.date() == datetime.now().date():
                     print(f"Loading {ticker} from cache...")
-                    return pd.read_parquet(cache_path)
+                    df = pd.read_parquet(cache_path)
+                    df.attrs["source"] = "🟡 CACHE (File)"
+                    return df
             except Exception as e:
                 print(f"Error reading cache for {ticker}: {e}")
 
@@ -141,7 +206,179 @@ class DataFetcher:
                 df.to_parquet(cache_path)
             except Exception as e:
                 print(f"Error saving cache for {ticker}: {e}")
+        
+        # If we got here, it was a fresh fetch (Live) not in cache
+        df.attrs["source"] = "🟢 LIVE"
+        return df
+
+    def fetch_batch_ohlcv(self, tickers: list[str], period: str = "2y") -> dict:
+        """
+        Batch fetch optimized for DB.
+        """
+        results = {}
+        if self.db:
+             with Timer(f"BatchDBFetch::{len(tickers)}"):
+                 results = self.db.fetch_batch_ohlcv(tickers, period)
+                 print(f"Batch DB returned {len(results)}/{len(tickers)} tickers.")
+                 # Tag them
+                 for t, df in results.items():
+                     df.attrs["source"] = "🟠 CACHE (DB Batch)"
+        else:
+             print("❌ No DB configured for Batch Fetch!")
+        
+        # Fill missing with sequential (cache misses or if no DB)
+        missing = [t for t in tickers if t not in results]
+        if missing:
+             print(f"⚠️ Batch Fetch Miss: {len(missing)} tickers missing (falling back to sequential): {missing}")
+             with Timer(f"BatchFallback::{len(missing)}"):
+                 for t in missing:
+                     results[t] = self.fetch_ohlcv(t, period)
+                 
+        return results
+
+    def fetch_ohlcv_legacy(self, ticker: str, period: str = "2y", use_cache: bool = True) -> pd.DataFrame:
+        """
+        Fetch daily OHLCV data.
+        """
+        # --- STRATEGY: LIVE (API First -> Save DB -> Fallback DB) ---
+        if Config.DATA_STRATEGY == "LIVE":
+             # 0. Smart Cache Optimization
+             # Even in Live Mode, if we have "Fresh" data in DB, use it.
+             if self.db:
+                 with Timer(f"SmartCheck::{ticker}"):
+                     # Check in-memory cache first, then fall back to DB query
+                     latest_date_str = self.date_cache.get(ticker)
+                     if not latest_date_str:
+                          latest_date_str = self.db.get_latest_date(ticker)
+                          
+                     if latest_date_str:
+                         latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d").date()
+                         today = datetime.now().date()
+                         
+                         # Simple Freshness: Is latest date >= today (or is it weekend?)
+                         # If today is Sat/Sun, and latest is Friday, it's fresh.
+                         is_fresh = False
+                         if latest_date >= today:
+                             is_fresh = True
+                         elif today.weekday() >= 5: # Sat=5, Sun=6
+                             # If weekend, check if we have Friday
+                             # (Logic simplified: if latest is within 2 days)
+                             delta = (today - latest_date).days
+                             if delta <= 2:
+                                 is_fresh = True
+                         elif latest_date == today: # Explicit catch
+                             is_fresh = True
+
+                         if is_fresh:
+                             print(f"✨ Smart Cache: Found fresh data for {ticker} in DB.")
+                             with Timer(f"DBFetch::{ticker}"):
+                                 df = self.db.fetch_ohlcv(ticker, period)
+                             if not df.empty:
+                                 df.attrs["source"] = "🟠 CACHE (DB)"
+                                 return df
+
+             # 1. Try Live
+             print(f"📡 Fetching live data for {ticker}...")
+             try:
+                 df = self.live_provider.fetch_ohlcv(ticker, period)
+                 if df.empty and isinstance(self.live_provider, AlphaVantageProvider):
+                      print("Switching to YFinance...")
+                      df = YFinanceProvider().fetch_ohlcv(ticker, period)
+                 
+                 if not df.empty:
+                     if self.db: 
+                         print(f"💾 Saving to DB...")
+                         self.db.save_ohlcv(ticker, df, source="live")
+                     df.attrs["source"] = "🟢 LIVE"
+                     return df
+             except Exception as e:
+                 print(f"Live Fetch Error: {e}")
+            
+             # 2. Fallback DB
+             if self.db:
+                 print(f"⚠️ Live failed. Falling back to DB for {ticker}")
+                 df = self.db.fetch_ohlcv(ticker, period)
+                 if not df.empty:
+                     df.attrs["source"] = "🟠 CACHE (DB)"
+                     return df
+             return pd.DataFrame()
+
+        # --- STRATEGY: SYNTHETIC (DB First -> Live -> Save DB) ---
+        if Config.DATA_STRATEGY == "SYNTHETIC":
+            # 1. Try DB
+            if self.db:
+                df = self.db.fetch_ohlcv(ticker, period)
+                if not df.empty:
+                    df.attrs["source"] = "🟠 CACHE (DB)"
+                    return df
+            
+            # 2. Fallback Live
+            print(f"📉 DB Miss for {ticker}. Fetching from Live API...")
+            try:
+                df = self.live_provider.fetch_ohlcv(ticker, period)
+                if df.empty and isinstance(self.live_provider, AlphaVantageProvider):
+                     df = YFinanceProvider().fetch_ohlcv(ticker, period)
                 
+                if not df.empty and self.db:
+                    self.db.save_ohlcv(ticker, df, source="live")
+                    df.attrs["source"] = "🟢 LIVE"
+                    return df
+            except Exception as e:
+                print(f"Fallback Error for {ticker}: {e}")
+            
+            return pd.DataFrame()
+
+        # --- STRATEGY: LEGACY (File Cache) ---
+        # Falls through to existing lines 70+
+        cache_path = self._get_cache_path(ticker, period)
+        
+        # Try cache first
+        if use_cache and os.path.exists(cache_path):
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if mtime.date() == datetime.now().date():
+                    print(f"Loading {ticker} from cache...")
+                    df = pd.read_parquet(cache_path)
+                    df.attrs["source"] = "🟡 CACHE (File)"
+                    return df
+            except Exception as e:
+                print(f"Error reading cache for {ticker}: {e}")
+
+        # Fetch from Provider
+        print(f"Fetching {ticker} from Provider...")
+        df = pd.DataFrame()
+        try:
+            df = self.provider.fetch_ohlcv(ticker, period)
+        except Exception as e:
+            print(f"Error downloading {ticker}: {e}")
+        
+        # Runtime Fallback: If primary failed/empty and we aren't already using YFinance
+        if df.empty and not isinstance(self.provider, YFinanceProvider):
+            print(f"Primary provider returned no data for {ticker}. Attempting fallback to YFinance...")
+            try:
+                fallback = YFinanceProvider()
+                df = fallback.fetch_ohlcv(ticker, period)
+            except Exception as e:
+                print(f"Fallback fetch failed: {e}")
+
+        if df.empty:
+            print(f"Warning: No data found for {ticker}")
+            return pd.DataFrame()
+            
+        # Standardize columns just in case
+        required_cols = ["open", "high", "low", "close", "volume"]
+        # Ensure lowercase
+        df.columns = [c.lower() for c in df.columns]
+        
+        # Save to cache
+        if not df.empty:
+            try:
+                df.to_parquet(cache_path)
+            except Exception as e:
+                print(f"Error saving cache for {ticker}: {e}")
+        
+        # If we got here, it was a fresh fetch (Live) not in cache
+        df.attrs["source"] = "🟢 LIVE"
         return df
 
     
@@ -163,6 +400,7 @@ class DataFetcher:
                 
                 if news:
                     if self.db: self.db.save_news(ticker, news)
+                    for n in news: n["_source"] = "🟢 LIVE"
                     return news
             except Exception as e:
                 print(f"Live News Error: {e}")
@@ -170,7 +408,9 @@ class DataFetcher:
             # 2. Fallback DB
             if self.db:
                 print("Falling back to DB news...")
-                return self.db.fetch_news(ticker, limit)
+                news = self.db.fetch_news(ticker, limit)
+                for n in news: n["_source"] = "🟠 CACHE (DB)"
+                return news
             return []
 
         # --- STRATEGY: SYNTHETIC (DB First) ---
@@ -188,6 +428,7 @@ class DataFetcher:
                 
                 if news and self.db:
                     self.db.save_news(ticker, news)
+                    for n in news: n["_source"] = "🟢 LIVE"
                     return news
             except Exception as e:
                 print(f"News Fallback Error: {e}")
@@ -275,10 +516,6 @@ class DataFetcher:
         """
         Fetch alternative data with persistence.
         """
-    def fetch_alt_data(self, ticker: str, days: int = 30) -> pd.DataFrame:
-        """
-        Fetch alternative data with persistence.
-        """
         today = pd.Timestamp.now().normalize()
         history_df = pd.DataFrame(columns=["Date", "Web_Attention", "Social_Sentiment"])
 
@@ -313,14 +550,23 @@ class DataFetcher:
                  has_today = True
 
         if Config.DATA_STRATEGY in ["LIVE", "PRODUCTION"]:
-            # Always fetch fresh if in Live Mode (overwrite/update today)
-            need_fetch = True
+            # In PRODUCTION, trust the DB cache for today if it exists
+            if Config.DATA_STRATEGY == "PRODUCTION" and has_today:
+                print(f"✨ Smart Cache: Found fresh data for {ticker} in DB.")
+                need_fetch = False
+            else:
+                # Live mode typically wants real-time updates, or strictly forcing refresh
+                need_fetch = True
         elif Config.DATA_STRATEGY == "SYNTHETIC":
             # Only fetch if missing
             need_fetch = not has_today
         else:
             # Legacy default
             need_fetch = not has_today
+
+        # Initialize for backfill scope
+        current_attention = 0.0
+        current_sentiment = 0.0
 
         if need_fetch:
             print(f"🌍 Fetching Live Alt Data for {ticker}...")
@@ -364,26 +610,6 @@ class DataFetcher:
                     print(f"Error saving alt data cache: {e}")
 
         # 5. Format for Return
-        history_df = history_df.set_index("Date").sort_index()
-        
-        # Cold Start Backfill
-        if len(history_df) < days:
-             needed = days - len(history_df)
-             # Use current values to backfill
-             att = history_df["Web_Attention"].iloc[-1] if not history_df.empty else 0
-             sent = history_df["Social_Sentiment"].iloc[-1] if not history_df.empty else 0
-             
-             oldest_date = history_df.index[0] if not history_df.empty else today
-             backfill_dates = pd.date_range(end=oldest_date - pd.Timedelta(days=1), periods=needed)
-             backfill_df = pd.DataFrame(index=backfill_dates)
-             backfill_df["Web_Attention"] = att
-             backfill_df["Social_Sentiment"] = sent
-             
-             history_df = pd.concat([backfill_df, history_df]).sort_index()
-
-        return history_df.tail(days)
-
-        # 5. Format for Return
         # Ensure we return at least 'days' rows if possible, or backfill if new
         history_df = history_df.set_index("Date").sort_index()
         
@@ -424,6 +650,7 @@ class DataFetcher:
                        sector=profile.get("sector", ""), 
                        industry=profile.get("industry", "")
                    )
+                if profile: profile["_source"] = "🟢 LIVE"
             except Exception as e:
                 print(f"Profile Fetch Error: {e}")
         
@@ -444,6 +671,7 @@ class DataFetcher:
         """
         if Config.USE_SYNTHETIC_DB:
              data = self.provider.fetch_key_metrics(ticker)
+             data["_source"] = "🟠 CACHE (DB)"
              # If valid data found (pe_ratio > 0 is a heuristic, key check better)
              if data.get('market_cap', 0) > 0 or data.get('pe_ratio', 0) > 0:
                  return data
@@ -467,7 +695,12 @@ class DataFetcher:
                 
                 # Save
                 if data:
-                    self.provider.save_fundamentals(ticker, data)
+                    # Save to DB if provider supports it, or direct to DB if available
+                    if hasattr(self.provider, 'save_fundamentals'):
+                        self.provider.save_fundamentals(ticker, data)
+                    elif self.db:
+                        self.db.save_fundamentals(ticker, data)
+                    data["_source"] = "🟢 LIVE"
                     return data
              except Exception as e:
                 print(f"Fund Fallback Error: {e}")

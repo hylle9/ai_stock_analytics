@@ -5,19 +5,29 @@ from src.utils.config import Config
 
 class DBManager:
     """
-    Manages DuckDB connection and schema initialization.
+    Centralized database connection manager.
+    Handles schema initialization and connection pooling.
     """
-    DB_PATH = os.path.join(Config.DATA_CACHE_DIR, "market_data.duckdb")
+    DATA_DIR = Config.DATA_CACHE_DIR
+    DB_PATH = os.path.join(DATA_DIR, "market_data.duckdb")
+    _SCHEMA_INITIALIZED = False
 
-    def __init__(self, db_path: Optional[str] = None):
-        self.db_path = db_path or self.DB_PATH
-        # Ensure dir exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.initialize_db()
+    def __init__(self, read_only: bool = False):
+        self.read_only = read_only
+        os.makedirs(self.DATA_DIR, exist_ok=True)
+        # Attempt to initialize schema only if not read-only and not already done
+        if not self.read_only and not DBManager._SCHEMA_INITIALIZED:
+            try:
+                self.initialize_db()
+                DBManager._SCHEMA_INITIALIZED = True
+            except Exception as e:
+                # If locked, it usually means another process is writing or holding the lock.
+                # Use a soft warning, as schema might likely represent "already initialized"
+                print(f"⚠️ DB Schema Init Skipped (Persistence Check): {e}")
 
     def get_connection(self):
-        """Returns a connection to the DuckDB instance."""
-        return duckdb.connect(self.db_path)
+        """Returns a new DuckDB connection."""
+        return duckdb.connect(self.DB_PATH, read_only=self.read_only)
 
     def initialize_db(self):
         """Creates tables if they don't exist."""
@@ -31,9 +41,17 @@ class DBManager:
                     sector VARCHAR,
                     industry VARCHAR,
                     description TEXT,
+                    retrieval_origin VARCHAR,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Auto-Migration: checking if column exists (simple try/catch or checks)
+            try:
+                con.execute("ALTER TABLE dim_assets ADD COLUMN retrieval_origin VARCHAR")
+            except:
+                pass # Already exists
+
 
             # 1.5 Competitors Junction
             con.execute("""
@@ -47,6 +65,18 @@ class DBManager:
                     FOREIGN KEY (ticker_b) REFERENCES dim_assets(ticker)
                 );
             """)
+            
+            # Migration for existing DBs (Fix for Infinite AI Loop)
+            try:
+                con.execute("ALTER TABLE dim_competitors ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            except:
+                pass 
+            
+            # Backfill nulls
+            try:
+                con.execute("UPDATE dim_competitors SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+            except: 
+                pass
 
             # 2. Market Data Fact
             con.execute("""
@@ -152,5 +182,31 @@ class DBManager:
                 );
             """)
             
+        finally:
+            con.close()
+
+    def update_asset_origin(self, ticker: str, origin: str):
+        """
+        Updates the retrieval_origin for an asset. 
+        Appends if already exists to allow multi-origin (e.g. "RBRS,AIRS").
+        """
+        con = self.get_connection()
+        try:
+            # Check existing
+            current = con.execute("SELECT retrieval_origin FROM dim_assets WHERE ticker=?", (ticker,)).fetchone()
+            new_origin = origin
+            
+            if current and current[0]:
+                existing_parts = set(current[0].split(","))
+                existing_parts.add(origin)
+                # Keep sorted for consistency
+                new_origin = ",".join(sorted(list(existing_parts)))
+            
+            # Upsert asset if not exists (minimal) then update
+            con.execute("INSERT OR IGNORE INTO dim_assets (ticker) VALUES (?)", (ticker,))
+            con.execute("UPDATE dim_assets SET retrieval_origin=? WHERE ticker=?", (new_origin, ticker))
+            
+        except Exception as e:
+            print(f"DB Origin Update Error: {e}")
         finally:
             con.close()

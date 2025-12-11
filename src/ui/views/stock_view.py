@@ -6,35 +6,55 @@ import subprocess
 import webbrowser
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.express as px
+
+# Internal Modules
 from src.data.ingestion import DataFetcher
 from src.analytics.technical import add_technical_features
 from src.utils.profiling import Timer
 from src.analytics.backtester import run_sma_strategy
 from src.analytics.metrics import calculate_returns, calculate_volatility, calculate_relative_volume, calculate_volume_acceleration
-
 from src.models.forecasting import ForecastModel
 from src.analytics.sentiment import SentimentAnalyzer
 from src.analytics.fusion import FusionEngine
 from src.analytics.gemini_analyst import GeminiAnalyst
-import plotly.express as px
 from src.analytics.insights import InsightManager
 from src.analytics.prompt_engineering import generate_deep_dive_prompt
 from src.analytics.activity import ActivityTracker
 from src.data.relationships import RelationshipManager
 from src.utils import defaults
-from src.utils import defaults
 from src.utils.config import Config
+
+# --- 1. CACHED DATA LOADERS ---
+# Streamlit re-runs the script on every interaction. We MUST use caching (@st.cache_data)
+# for heavy operations like data fetching, otherwise the app will be unresponsive.
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_technical_features(df):
-    """Cached version of technical feature generation. Only re-runs if df changes."""
+    """
+    Computes technical indicators (RSI, SMAs) on a dataframe.
+    Cached for 1 hour so we don't re-compute if the input DF hasn't changed.
+    """
     return add_technical_features(df)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_dashboard_data_v2(ticker: str):
     """
-    Consolidated data loader for the stock dashboard.
-    Fetches EVERYTHING needed for the view to allow instant interactions.
+    Consolidated Data Loader mechanism.
+    Instead of fetching bits and pieces scattered throughout the UI code,
+    we fetch EVERYTHING needed for a complete view in one go.
+    
+    This improves performance (one latency hit) and robustness (no partial failures).
+    
+    Returns:
+        Dictionary containing:
+        - df_analysis: Historial price data with technicals
+        - bench_df: Benchmark (S&P 500) data
+        - news: Latest news articles
+        - alt_data: Social sentiment/attention data
+        - pressure_score: The calculated fusion score
+        - components: Breakdown of the score (RSI, Volatility, etc)
+        - ai_insight: Cached text analysis from Gemini
     """
     fetcher = DataFetcher()
     data = {
@@ -51,54 +71,38 @@ def load_dashboard_data_v2(ticker: str):
         "deep_insight_weekly": None,
         "profile_error": None,
         "metrics": {},
-        "sim_results": {} # Added for backtest simulation results
+        "sim_results": {} 
     }
 
-    # 1. Fetch OHLCV (Max)
+    # STEP 1: Fetch Price History (Max available)
+    # We fetch 'max' so we can do long-term SMA calculations (SMA200).
     df_analysis = fetcher.fetch_ohlcv(ticker, period="max")
     
     if df_analysis.empty:
-        return data # Invalid
+        return data # Return empty valid=False if no data found
         
     data["valid"] = True
     
-    data["valid"] = True
-    
-    # 2. Fire-and-forget profile
-    # BLOCKED: This call was taking 17s in Production (likely API rate limit hang). 
-    # Profile data is optional or lazily loaded elsewhere.
-    # if Config.DATA_STRATEGY != "LEGACY":
-    #      try:
-    #          fetcher.get_company_profile(ticker)
-    #      except Exception as e:
-    #          data["profile_error"] = str(e)
-
-    # 3. Technicals (on Max)
-    # Re-use existing cached tech function or call directly
-    # Since we are inside a cached function, calling another cached function is fine but maybe redundant.
-    # Let's call direct to save overhead    # 3. Technicals (on Max)
+    # STEP 2: Calculate Technical Indicators
+    # (Adds columns like 'sma_50', 'rsi', 'upper_band' to the dataframe)
     with Timer(f"TechFeatures:Main:{ticker}"):
         df_analysis = add_technical_features(df_analysis)
         
-    # 4. Benchmark (Max) - Moved UP for Backtester dependency
+    # STEP 3: Fetch Benchmark Data (S&P 500 ETF 'RSP')
+    # We use RSP (Equal Weight) instead of SPY as it's a better representation of the "average stock".
     bench_df = fetcher.fetch_ohlcv("RSP", period="max")
     if not bench_df.empty:
         with Timer("TechFeatures:Bench"):
              bench_df = add_technical_features(bench_df)
-        # Align dates
+        
+        # Align dates: Slice benchmark to start at the same time as our stock data
         start_date = df_analysis.index.min()
         bench_df = bench_df[bench_df.index >= start_date]
         data["bench_df"] = bench_df
 
-    # 5. Backtest Simulation (Runs on analysis df + benchmark)
-    # 5. Backtest Simulation (REMOVED - Moved to View for Filtering)
-    # This was previously running on Full History.
-    # We now run it in the View logic on 'chart_df'.
-    data["sim_results"] = {}
-        
     data["df_analysis"] = df_analysis
 
-    # 5. Alt Data & News
+    # STEP 4: Fetch Alternative Data (Social & News)
     with Timer(f"API:AltData:{ticker}"):
         alt_data = fetcher.fetch_alt_data(ticker)
     data["alt_data"] = alt_data
@@ -107,36 +111,38 @@ def load_dashboard_data_v2(ticker: str):
         news = fetcher.fetch_news(ticker, limit=20)
     data["news"] = news
 
-    # 6. Analysis / Scores
-    # Sentiment
+    # STEP 5: Calculate Scores (The "Brain")
+    
+    # A. Sentiment Analysis (Scan news headlines)
     with Timer("Analyzer:Sentiment"):
         analyzer = SentimentAnalyzer()
         news_score = analyzer.analyze_news(news)
     data["news_score"] = news_score
     
-    # Pressure Score Logic
+    # B. Fusion Engine (Pressure Score)
     fusion = FusionEngine()
     
-    # Normalization inputs
+    # Gather inputs for Fusion
     rsi = df_analysis['rsi'].iloc[-1] if 'rsi' in df_analysis.columns else 50
+    
+    # Helper to determine trend strength (e.g. are we above SMA50?)
     from src.analytics.metrics import calculate_trend_strength
     trend_norm = calculate_trend_strength(df_analysis)
     
-    # Vols
+    # Volatility
     returns = calculate_returns(df_analysis['close'])
     vol = calculate_volatility(returns).iloc[-1]
+    vol_norm = min(1.0, vol * 2) # Normalize approx 0-50% vol to 0-1
     
-    # Vol Norm
-    vol_norm = min(1.0, vol * 2) 
-    
-    # Attention Norm
+    # Attention (Social)
     cur_att = alt_data['Web_Attention'].iloc[-1]
     att_norm = min(1.0, cur_att / 100.0)
 
-    # Volume Metrics
+    # Volume (Crowd Interest)
     rel_vol = calculate_relative_volume(df_analysis, window=20)
     vol_acc = calculate_volume_acceleration(df_analysis, window=3)
 
+    # Compute Final Score
     with Timer("Analyzer:Fusion"):
         pressure_score = fusion.calculate_pressure_score(
             price_trend=trend_norm,
@@ -148,7 +154,7 @@ def load_dashboard_data_v2(ticker: str):
         )
     data["pressure_score"] = pressure_score
     
-    # Save components for UI
+    # Save the raw components so we can display them in the UI (e.g. "High Volatility", "Strong Trend")
     data["components"] = {
         "rsi": rsi,
         "vol": vol,
@@ -160,10 +166,8 @@ def load_dashboard_data_v2(ticker: str):
         "cur_att": cur_att
     }
     
-    
-    # 7. Peer Benchmarks (Consolidated)
-    peers = []
-    # 7. Peer Benchmarks (Consolidated)
+    # STEP 6: Peer Benchmarking
+    # Find peer stocks to compare against (Company A vs Company B, C, D)
     peers = []
     try:
         with Timer(f"Peers:Init:{ticker}"):
@@ -171,6 +175,7 @@ def load_dashboard_data_v2(ticker: str):
             
         with Timer(f"Peers:Query:{ticker}"):
             peers = rm.get_industry_peers(ticker, limit=4)
+            # If no peers found in Graph Database, use generic fallback list
             if not peers:
                   peers = [t for t in defaults.DEFAULT_UNIVERSE_TICKERS if t != ticker][:4]
     except Exception as e:
@@ -180,10 +185,9 @@ def load_dashboard_data_v2(ticker: str):
     sent_vals = []
     att_vals = []
     
-    # Batch Fetch for performance
+    # Calculate average metrics for the peer group
     try:
         if peers:
-            # Note: Fetch Batch OHLCV prints "Batch DB returned..."
             with Timer(f"Peers:Fetch:{ticker}"):
                  peer_results = fetcher.fetch_batch_ohlcv(peers, period="6mo")
             
@@ -192,10 +196,7 @@ def load_dashboard_data_v2(ticker: str):
                     pdf = peer_results.get(p, pd.DataFrame())
                     if not pdf.empty:
                         try:
-                            # OPTIMIZATION: We only need the latest RSI for the peer comparison metric.
-                            # We do NOT need to calculate technicals on 20 years of data.
-                            # Slicing to last 150 days is sufficient for RSI-14 to stabilize.
-                            # This fixes the 16s delay loop.
+                            # Optimize: Slice only recent data for RSI calculation
                             if len(pdf) > 200:
                                 pdf_slice = pdf.tail(200).copy()
                             else:
@@ -212,152 +213,115 @@ def load_dashboard_data_v2(ticker: str):
     def safe_avg(vals, default=50):
         return sum(vals) / len(vals) if vals else default
 
-    rsi_avg = safe_avg(rsi_vals, 50)
-    sent_avg = safe_avg(sent_vals, 0)
-    att_avg = safe_avg(att_vals, 0)
-    
+    # These averages serve as the "Baseline" for our gauges
     data["benchmarks"] = {
-        "rsi_avg": rsi_avg,
-        "sent_avg": sent_avg,
-        "att_avg": att_avg
+        "rsi_avg": safe_avg(rsi_vals, 50),
+        "sent_avg": safe_avg(sent_vals, 0),
+        "att_avg": safe_avg(att_vals, 0)
     }
 
-    # 8. AI Insights
-    # We only FETCH here. We don't want to potentially trigger valid Gemini calls  
-    # if we just want to load data. 
-    # However, user wants "optimization". If we don't fetch here, 
-    # the UI will trigger it and it won't be in this cache.
-    # Strategy: 
-    # - Try to get Cached Insight.
-    # - If None, generate one (this means first load takes time, subsequent are fast).
-    # - This satisfies "Consolidated Data Loader".
-    
+    # STEP 7: AI Insights (Gemini)
+    # We attempt to retrieve cached generated text to avoid API costs/latency.
     im = InsightManager()
     
     with Timer(f"InsightManager:Load:{ticker}"):
-        # Weekly Deep
+        # Check for "Weekly Deep Dive" (Valid for 7 days)
         cached_weekly = im.get_todays_insight(ticker, report_type="deep_research_weekly", valid_days=7)
         if cached_weekly and ("Rate Limit" in cached_weekly or "Quota" in cached_weekly):
-             cached_weekly = None
+             cached_weekly = None # Discard error messages so we can retry
         data["deep_insight_weekly"] = cached_weekly
         
-        # Daily
+        # Check for "Daily Snapshot" (Valid for 1 day)
         cached_daily = im.get_todays_insight(ticker, report_type="deep_dive", valid_days=1)
-        # DEFERRED: Generation moved to render_stock_view to allow UI to load first.
-        
         data["ai_insight"] = cached_daily
         
-        
-        # 9. Technical Insight (Pattern Recognition)
-        # MOVED OUT OF CHACHE to allow instant refresh
+        # Technical analysis text is loaded lazily in the UI
         data["technical_insight"] = None
-
-    # 10. Tracker Log (Side effect) -> MOVED TO MAIN VIEW to capture Rec
-    # try:
-    #     with Timer(f"Tracker:LogView:{ticker}"):
-    #          tracker = ActivityTracker()
-    #          tracker.log_view(ticker, pressure_score)
-    # except:
-    #      pass
 
     return data
 
+
+# --- 2. PLOTTING FUNCTIONS ---
+
 def plot_stock_chart(df, ticker, forecast=None, benchmark_df=None):
-    # Create figure with secondary y-axis
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, subplot_titles=(f'{ticker} Price vs Market', 'Volume'),
-                        row_heights=[0.7, 0.3],
-                        specs=[[{"secondary_y": True}], [{"secondary_y": False}]])
+    """
+    Creates the main interactive Plotly chart.
+    Area 1 (Top): Candlesticks, Moving Averages, Benchmark Line, Crossover Markers.
+    Area 2 (Bottom): Volume Bars.
+    """
+    # Create figure with 2 subplots sharing the X-axis (Dates)
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.03, 
+        subplot_titles=(f'{ticker} Price vs Market', 'Volume'),
+        row_heights=[0.7, 0.3], # 70% Price, 30% Volume
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
+    )
 
-    # Candlestick (Primary Y)
-    fig.add_trace(go.Candlestick(x=df.index,
-                                 open=df['open'],
-                                 high=df['high'],
-                                 low=df['low'],
-                                 close=df['close'],
-                                 name='OHLC'), row=1, col=1, secondary_y=False)
+    # A. Candlestick Chart (Open, High, Low, Close)
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        name='OHLC'
+    ), row=1, col=1, secondary_y=False)
 
-    # Forecast
+    # B. Forecast Overlay (Prophet)
+    # Renders dashed line for prediction + shaded area for confidence interval
     if forecast is not None:
         fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], line=dict(color='purple', width=2, dash='dash'), name='Forecast'), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], line=dict(color='rgba(128,0,128,0.2)', width=0), showlegend=False), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], line=dict(color='rgba(128,0,128,0.2)', width=0), fill='tonexty', fillcolor='rgba(128,0,128,0.2)', name='Confidence'), row=1, col=1, secondary_y=False)
 
-    # MA
-    sma20 = df['sma_20'] if 'sma_20' in df.columns else pd.Series([np.nan]*len(df), index=df.index)
-    sma50 = df['sma_50'] if 'sma_50' in df.columns else pd.Series([np.nan]*len(df), index=df.index)
-    sma200 = df['sma_200'] if 'sma_200' in df.columns else pd.Series([np.nan]*len(df), index=df.index)
-
+    # C. Moving Averages (The colorful lines)
     if 'sma_20' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma_20'], line=dict(color='#ffd700', width=1), name='SMA 20'), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['sma_20'], line=dict(color='#ffd700', width=1), name='SMA 20 (Fast)'), row=1, col=1, secondary_y=False)
     if 'sma_50' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma_50'], line=dict(color='orange', width=1), name='SMA 50'), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['sma_50'], line=dict(color='orange', width=1), name='SMA 50 (Medium)'), row=1, col=1, secondary_y=False)
     if 'sma_200' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['sma_200'], line=dict(color='blue', width=1), name='SMA 200'), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['sma_200'], line=dict(color='blue', width=1), name='SMA 200 (Trend)'), row=1, col=1, secondary_y=False)
 
-    # --- CROSSOVER LOGIC (Golden/Death Cross) ---
+    # D. Crossover Markers (Golden Cross / Death Cross)
     last_golden_cross_date = None
 
     def find_crossovers(fast, slow, name):
+        """Identifies where two lines cross."""
         nonlocal last_golden_cross_date
         if fast.isna().all() or slow.isna().all(): return
         
         diff = fast - slow
+        # Find points where the sign of difference changes (Positive <-> Negative)
         signs = np.sign(diff)
         sign_change = ((np.roll(signs, 1) - signs) != 0) & (signs != 0)
-        sign_change[0] = False
+        sign_change[0] = False # Ignore first point noise
         
-        # Get indices
         crossover_dates = df.index[sign_change]
         crossover_vals = slow[sign_change]
         
         if len(crossover_dates) > 0:
             for d, v in zip(crossover_dates, crossover_vals):
-                # Check direction
-                # If fast > slow now, it was < before -> Golden Cross (Green)
-                # We check the value of 'diff' at date 'd'
                 is_golden = diff.loc[d] > 0
-                
                 color = 'green' if is_golden else 'red'
-                symbol = 'circle' # filled circle
-                label = f"{name} {'Bull' if is_golden else 'Bear'}"
                 
+                # Plot Marker
                 fig.add_trace(go.Scatter(
                     x=[d], y=[v],
                     mode='markers',
-                    marker=dict(symbol=symbol, size=14, color=color, line=dict(color='white', width=1)),
-                    name=label,
-                    showlegend=False, # Too many items if we legend every point
+                    marker=dict(symbol='circle', size=14, color=color, line=dict(color='white', width=1)),
+                    name=f"{name} {'Bull' if is_golden else 'Bear'}",
+                    showlegend=False,
                     hoverinfo='text',
-                    hovertext=f"{d.date()} | {label}"
+                    hovertext=f"{d.date()} | {name} {'Bull' if is_golden else 'Bear'}"
                 ), row=1, col=1, secondary_y=False)
                 
-                if name == "SMA20/50" and is_golden:
+                if name == "Signal" and is_golden:
                     if last_golden_cross_date is None or d > last_golden_cross_date:
                         last_golden_cross_date = d
 
-        # Add a dummy trace for legend explanation if potential crosses exist
-        if len(crossover_dates) > 0:
-             fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', 
-                                    marker=dict(symbol='circle', size=10, color='green'), 
-                                    name=f'{name} Golden Cross', legendgroup=f'{name}_bull'), row=1, col=1)
-             fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', 
-                                    marker=dict(symbol='circle', size=10, color='red'), 
-                                    name=f'{name} Death Cross', legendgroup=f'{name}_bear'), row=1, col=1)
-
-
-    # 1. SMA 20 vs SMA 50 (Short Term Momentum)
-    find_crossovers(sma20, sma50, "Signal")
+    # Run Crossover Logic: SMA 20 vs 50
+    find_crossovers(df['sma_20'], df['sma_50'], "Signal")
     
-    # 2. SMA 50 vs SMA 200 (Major Trend)
-    # find_crossovers(sma50, sma200, "Trend") # Optional: Keep simple or add both
-    # User specifically asked for SMA20/50 buy/sell signals.
-    # Let's do both but maybe different markers? Or just same/similar.
-    # User prompt: "when the SMA20 cross the SMA50... circle green/red"
-    # User also asked for "where SMA50 crosses SMA200" with different color.
-    # Let's keep 50/200 distinct -> Purple/Orange? 
-    # Actually, let's treat 50/200 as Major Signals.
-    
+    # Run Major Trend Crossover: SMA 50 vs 200 (Diamonds)
     def find_major_crossovers(fast, slow, name):
         if fast.isna().all() or slow.isna().all(): return
         diff = fast - slow
@@ -377,39 +341,40 @@ def plot_stock_chart(df, ticker, forecast=None, benchmark_df=None):
                 legendgroup='major_cross'
             ), row=1, col=1, secondary_y=False)
 
-    find_major_crossovers(sma50, sma200, "Major Trend (50/200)")
+    find_major_crossovers(df['sma_50'], df['sma_200'], "Major Trend (50/200)")
 
-    # --------------------------------------------
-
-    # Benchmark (Primary Y for visibility/comparison)
+    # E. Benchmark Line
     if benchmark_df is not None and 'sma_200' in benchmark_df.columns:
-        # Plot directly, let Plotly handle date alignment on shared X axis
         fig.add_trace(go.Scatter(x=benchmark_df.index, y=benchmark_df['sma_200'], 
                                line=dict(color='#9370DB', width=3), # Medium Purple
                                name='S&P Market Trend (Indexed)'), 
                       row=1, col=1, secondary_y=False)
 
-    # Volume
+    # F. Volume Bars (Bottom Subplot)
     fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume'), row=2, col=1)
 
+    # G. Layout Config
     fig.update_layout(height=600, xaxis_rangeslider_visible=False)
     fig.update_yaxes(title_text="Price & S&P (RSP)", secondary_y=False, row=1, col=1)
     
     return fig, last_golden_cross_date
 
 
-
-
+# --- 3. MAIN RENDER FUNCTION ---
 def render_stock_view():
+    """
+    Renders the entire 'Stock Analysis' page.
+    This function is called by app.py when the user navigates here.
+    """
     st.header("Stock Analysis")
     
-    # helper for session state mapping
+    # Initialize Session State
     if 'analysis_ticker' not in st.session_state:
         st.session_state.analysis_ticker = "AAPL"
         
     fetcher = DataFetcher()
 
-    # Search Expander
+    # --- UI COMPONENT: SEARCH BAR ---
     with st.expander("🔍 Find a Stock (Search by Name)", expanded=False):
         search_query = st.text_input("Company Name / Keyword", key="stock_search_box")
         if search_query:
@@ -428,52 +393,44 @@ def render_stock_view():
             else:
                 st.info("No matches found.")
 
+    # --- UI COMPONENT: TICKER ENTRY & CONTROLS ---
     col1, col2 = st.columns([1, 3])
     
     with col1:
-        # Ticker Input
+        # Ticker Box & Like Button
         c_tick, c_like = st.columns([3, 1])
         with c_tick:
             ticker = st.text_input("Ticker Symbol", value=st.session_state.analysis_ticker).upper().strip()
-        
         with c_like:
             st.text(" ")
             st.text(" ")
-            # Like button
             tracker = ActivityTracker()
             is_liked = tracker.is_liked(ticker)
             label = "❤️" if is_liked else "🤍"
             if st.button(label, key="like_btn", use_container_width=True):
                 tracker.toggle_like(ticker)
                 st.rerun()
-        # Update session state if manual change
-        if ticker != st.session_state.analysis_ticker:
-            st.session_state.analysis_ticker = ticker
-            
-        # Update session state if manual change
+                
         if ticker != st.session_state.analysis_ticker:
             st.session_state.analysis_ticker = ticker
             
         show_forecast = st.checkbox("Show Forecast (30d)", value=False)
 
-        # --- Add to Portfolio Widget ---
+        # Portfolio Quick-Add Widget
         if 'portfolio_manager' in st.session_state:
             pm = st.session_state.portfolio_manager
             portfolios = pm.list_portfolios()
             
             if portfolios:
                 with st.expander("📂 Add to Portfolio"):
-                    # Select Portfolio
                     p_names = [p.name for p in portfolios]
                     selected_p_name = st.selectbox("Select Portfolio", p_names)
                     selected_p = next((p for p in portfolios if p.name == selected_p_name), None)
                     
-                    # Inputs
                     c_shares, c_price = st.columns(2)
                     with c_shares:
                         shares = st.number_input("Shares", min_value=1, value=10)
                     with c_price:
-                        # Try to guess price if data loaded, else 0
                         cost_basis = st.number_input("Avg Cost", min_value=0.0, value=0.0, step=0.1)
                         
                     if st.button("Add Position"):
@@ -487,37 +444,26 @@ def render_stock_view():
                  st.caption("Create a portfolio first to add stocks.")
         
     if ticker:
-        alpha_banner = st.empty()
+        alpha_banner = st.empty() # Placeholder for "Beating Market" banner
         
-        # --- NEW: Consolidated Data Load ---
-        # This blocks on first run, then is instant for 1 hour.
+        # --- DATA LOADING (Triggers the big function) ---
         if st.sidebar.button("🔄 Force Refresh Data"):
              st.toast("Clearing cache and refreshing...", icon="♻️")
-             # Manually init fetcher to trigger refresh
              with st.spinner("Refetching data..."):
                  f = DataFetcher()
                  f.fetch_ohlcv(ticker, period="max", use_cache=False)
                  st.cache_data.clear()
                  st.rerun()
 
-        # Fetch Dashboard Data
         with st.spinner(f"Analyzing {ticker}..."):
             with Timer(f"StockView:LoadData:{ticker}"):
                 dashboard_data = load_dashboard_data_v2(ticker)
         
-        # Check if data loaded
-        if dashboard_data['df_analysis'].empty: # Changed from 'main_df' to 'df_analysis'
-             st.error(f"No data found for ticker '{ticker}'. Please ensure valid ticker, internet connection, or try again.")
+        if dashboard_data['df_analysis'].empty:
+             st.error(f"No data found for ticker '{ticker}'.")
              return
 
-        # Unpack Data
-        if dashboard_data.get("ai_insight") and "valid" in dashboard_data and dashboard_data["valid"]:
-             st.toast("✅ AI Insight Loaded from Cache (Fast Mode)", icon="⚡")
-        elif not dashboard_data.get("valid"):
-             st.toast("❌ Data Load Failed")
-        else:
-             st.toast("⚠️ AI Insight Generated (Cache Miss)", icon="🤖")
-
+        # Unpack loaded data for easier access
         df_analysis = dashboard_data["df_analysis"]
         bench_df = dashboard_data["bench_df"]
         alt_data = dashboard_data["alt_data"]
@@ -526,68 +472,48 @@ def render_stock_view():
         news_score = dashboard_data["news_score"]
         comps = dashboard_data["components"]
         
-        # Production Check
-        if Config.DATA_STRATEGY == "PRODUCTION":
-             is_syn = df_analysis['source'] != 'live' if 'source' in df_analysis.columns else pd.Series([True] * len(df_analysis), index=df_analysis.index)
-             syn_count = is_syn.sum()
-             if syn_count > 0:
-                 pct = (syn_count / len(df_analysis)) * 100
-                 st.warning(f"⚠️ **Production Mode**: {pct:.1f}% of loaded history is Synthetic. Metrics may be approximate.")
-             elif df_analysis.attrs.get("source") == "🟢 LIVE":
-                 st.info("✨ **Day 1 Analysis**: Fresh historic data retrieved. Tracking initiatied for forward testing.")
-
+        # Show Data Source Info (Live vs Synthetic)
         source_tag = df_analysis.attrs.get("source", "⚪ UNKNOWN")
         st.caption(f"Data Source: {source_tag}")
 
-        # Forecast (using analysis df)
+        # Forecast Logic
         forecast_df = None
         if show_forecast:
             with st.spinner("Generating forecast..."):
                 model = ForecastModel()
                 forecast_df = model.train_predict(df_analysis)
         
-        # Metrics (Latest)
-        returns = calculate_returns(df_analysis['close'])
-        vol = comps["vol"]
+        # --- METRICS ROW ---
         last_price = df_analysis['close'].iloc[-1]
         prev_price = df_analysis['close'].iloc[-2]
         change = (last_price - prev_price) / prev_price
         
-        # Display Metrics
         m1, m2, m3 = st.columns(3)
         m1.metric("Price", f"${last_price:.2f}", f"{change:.2%}")
-        m2.metric("Volatility (Ann.)", f"{vol:.2%}")
+        m2.metric("Volatility (Ann.)", f"{comps['vol']:.2%}")
         m3.metric("Volume", f"{df_analysis['volume'].iloc[-1]:,}")
 
-        # --- PRE-CALCULATE SIGNALS (Components unpacked above) ---
-        # Re-construct some locals for UI logic
+        # pre-calc locals for logic
         vol_acc = comps.get("vol_acc", 0)
         rel_vol = comps.get("rel_vol", 0)
         att_norm = comps.get("att_norm", 0)
         cur_att = comps.get("cur_att", 0)
         rsi = comps.get("rsi", 50)
 
-        # --- SECTION 1: MARKET PRESSURE (HERO) & MULTI-MODAL ANALYSIS ---
+        # --- SECTION: MULTI-MODAL ANALYSIS (The "Hero" Section) ---
         st.subheader("Multi-Modal Analysis")
-
-        # 1. Pressure Score Display (Prominent)
+        
         tp_col1, tp_col2 = st.columns([1, 2])
         with tp_col1:
+            # Display the Pressure Score Gauge
             st.metric(
                 "Pressure Score", 
                 f"{pressure_score:.1f}/100",
-                help="""
-                **Market Pressure Score (Hybrid)**
-                A composite index tracking:
-                1. Price Trend
-                2. Sentiment
-                3. Retail Interest (Social + Volume Anomalies)
-                4. Volatility
-                """
+                help="Composite index tracking Price, Sentiment, Retail Interest, and Volatility."
             )
             st.progress(pressure_score / 100)
             
-            # Dynamic Label for Retail Signal
+            # Show a textual label explaining WHY the score is high
             retail_msg = ""
             if vol_acc > 0.05:
                 retail_msg = "🚀 Volume Accelerating!"
@@ -599,132 +525,75 @@ def render_stock_view():
             if retail_msg:
                 st.caption(f"{retail_msg}")
 
-            st.info(f"""
-            **Interpretation:**
-            - **> 75 (Bullish):** High buying pressure.
-            - **< 25 (Bearish):** High selling pressure.
-            """)
+            st.info("""**Interpretation:**\n- **> 75 (Bullish):** High buying pressure.\n- **< 25 (Bearish):** High selling pressure.""")
 
         with tp_col2:
-             # Plot Alt Data (Moved from Tab 2)
+             # Plot Alternative Data (Web Attention & Social Sentiment)
             fig_alt = make_subplots(specs=[[{"secondary_y": True}]])
             fig_alt.add_trace(go.Scatter(x=alt_data.index, y=alt_data['Web_Attention'], name="Web Attention"), secondary_y=False)
             fig_alt.add_trace(go.Scatter(x=alt_data.index, y=alt_data['Social_Sentiment'], name="Social Sentiment", line=dict(dash='dot')), secondary_y=True)
             fig_alt.update_layout(title="Alternative Data Signals (30d)", height=250, margin=dict(l=20, r=20, t=30, b=20))
             st.plotly_chart(fig_alt, use_container_width=True)
 
-        # 2. Components Breakdown (Moved from Tab 2)
-        st.write("#### Signal Components")
-        
-        # --- CALC BENCHMARKS (Cached) ---
-        benchmarks = dashboard_data.get("benchmarks", {"rsi_avg": 50, "sent_avg": 0, "att_avg": 0})
-        rsi_avg = benchmarks["rsi_avg"]
-        
-        # --- DEFINITIONS RESTORED ---
-        att_delta = cur_att - benchmarks["att_avg"]
-        rsi_delta = rsi - rsi_avg
-        # ----------------------------
-
         st.markdown("---")
+        
+        # --- AI INSIGHT (GEMINI) ---
         st.subheader("First-Class AI Insight")
         st.caption("Qualitative Analysis of Multi-Modal Signals")
         
-        im = InsightManager() 
-        # 1. Check for Weekly Deep Research (Cached in dashboard_data)
         cached_weekly = dashboard_data["deep_insight_weekly"]
+        cached_daily = dashboard_data["ai_insight"]
 
         if cached_weekly:
              st.info(f"🧬 **Deep Research Report** (Cached < 7 days)")
              st.markdown(cached_weekly)
-        
+        elif cached_daily:
+            st.success(f"Standard Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
+            st.markdown(cached_daily)
         else:
-            # 2. Standard Daily Insight (Cached in dashboard_data)
-            cached_daily = dashboard_data["ai_insight"]
-            
-            if cached_daily:
-                st.success(f"Standard Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
-                st.markdown(cached_daily)
-            else:
-                # Auto-Generate Standard Insight (Lazy Load)
-                with st.spinner("🤖 Gemini is analyzing news & fundamentals..."):
-                    try:
-                        analyst = GeminiAnalyst()
-                        metrics_context = {
-                            'rsi': rsi,
-                            'sentiment_score': news_score,
-                            'attention_score': cur_att,
-                            'alpha_50': g50_a if 'g50_a' in locals() else 0,
-                            'pressure_score': pressure_score
-                        }
-                        report = analyst.analyze_news(ticker, news, metrics_context)
-                        
-                        if "Error" not in report:
-                            im.save_insight(ticker, report, report_type="deep_dive")
-                            st.markdown(report)
-                        else:
-                            st.warning(f"AI could not generate report: {report}")
-                    except Exception as e:
-                        st.warning(f"AI Generation failed: {e}")
-
-            # 3. Deep Research Upgrade Option
-            st.write("#### 🧬 Need Deeper Answers?")
-            
-            # Safe Alpha Check
-            from src.analytics.market_comparison import calculate_market_alpha
-            market_alpha = calculate_market_alpha(ticker, stock_df=dashboard_data.get('main_df'), benchmark_df=dashboard_data.get('bench_df'))
-            
-            st.caption(f"Unlock implied mixed signals or verify why {ticker} is {'beating' if market_alpha > 0 else 'trailing'} the market.")
-            
-            if st.button("Run Deep Research (Gemini 1.5 Pro)"):
-                 with st.spinner("🕵️‍♂️ Conducting Deep Research (Industry, Competitors, Future)... This may take 30-60s."):
+            # Auto-Generate if missing (First time view)
+            with st.spinner("🤖 Gemini is analyzing news & fundamentals..."):
+                try:
                     analyst = GeminiAnalyst()
+                    # Context package for prompt
                     metrics_context = {
                         'rsi': rsi,
                         'sentiment_score': news_score,
                         'attention_score': cur_att,
-                        'alpha_50': market_alpha,
                         'pressure_score': pressure_score
                     }
-                    # Use new method
-                    deep_report = analyst.perform_deep_research(ticker, news, metrics_context)
+                    report = analyst.analyze_news(ticker, news, metrics_context)
                     
-                    if "Error" not in deep_report and "Rate Limit" not in deep_report:
-                        im.save_insight(ticker, deep_report, report_type="deep_research_weekly")
-                        st.rerun()
+                    if "Error" not in report:
+                        im = InsightManager()
+                        im.save_insight(ticker, report, report_type="deep_dive")
+                        st.markdown(report)
                     else:
-                        st.error(deep_report)
-        
-        # --- DAILY AI TECHNICAL ANALYSIS (Existing) ---
-        st.markdown("---")
-        st.write("#### 🤖 Daily Technical Summary")
-        
-        # Try to load fresh from DB (Bypass st.cache_data of main loader)
-        im = InsightManager()
-        cached_insight = im.get_todays_insight(ticker, report_type="technical")
-        
-        if cached_insight:
-            st.success(f"Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
-            st.markdown(cached_insight)
-        else:
-            # Auto-Generate Technicals (Lazy Load)
-            with st.spinner("📈 Analyzing chart patterns..."):
-                try:
-                    analyst = GeminiAnalyst()
-                    tech_report = analyst.analyze_technicals(ticker, df_analysis.tail(20))
-                    
-                    # DEBUG
-                    # st.write(f"DEBUG: Report Content -> {tech_report}")
-                    
-                    if "Error" not in tech_report and "unavailable" not in tech_report:
-                        im.save_insight(ticker, tech_report, report_type="technical")
-                        st.success("Analysis Generated & Saved! Refreshing...")
-                        st.rerun()
-                    else:
-                        st.warning(tech_report)
+                        st.warning(f"AI could not generate report: {report}")
                 except Exception as e:
-                    st.warning(f"Technical Analysis failed: {e}")
+                    st.warning(f"AI Generation failed: {e}")
 
-        # --- SECTION 2: PRICE & TECHNICALS (Was Tab 1) ---
+        # "Deep Research" Button Upgrade
+        st.write("#### 🧬 Need Deeper Answers?")
+        if st.button("Run Deep Research (Gemini 1.5 Pro)"):
+             with st.spinner("🕵️‍♂️ Conducting Deep Research (Industry, Competitors, Future)... This may take 30-60s."):
+                analyst = GeminiAnalyst()
+                metrics_context = {
+                    'rsi': rsi,
+                    'sentiment_score': news_score,
+                    'attention_score': cur_att,
+                    'pressure_score': pressure_score
+                }
+                deep_report = analyst.perform_deep_research(ticker, news, metrics_context)
+                
+                if "Error" not in deep_report:
+                    im = InsightManager() 
+                    im.save_insight(ticker, deep_report, report_type="deep_research_weekly")
+                    st.rerun()
+                else:
+                    st.error(deep_report)
+        
+        # --- SECTION: PRICE & TECHNICALS ---
         st.divider()
         st.header("Price & Technicals")
         
@@ -734,479 +603,180 @@ def render_stock_view():
                               index=3, # Default 1y
                               horizontal=True,
                               key="chart_period_selector")
-                              
-        # Fetch Data for Chart (Decoupled from Signal Analysis)
-        # Fetch Benchmark Once (Max) if not already
-        # (We could move this top-level, but lazy loading here is okay if we use local slicing)
-        # Actually, to avoid re-fetch on radio change, we rely on st.cache logic or move it up.
-        # But render_stock_view runs entirely on radio change. 
-        # So if we fetched 'max' above (df_analysis), we just slice it here.
         
-        # Helper to slice DataFrame based on period string
+        # Slicing Logic for the Chart
         def slice_period(df, period):
             if df.empty or period == "max": return df
-            
-            # Approximate slicing
-            days_map = {
-                "1mo": 30, "3mo": 90, "6mo": 180, 
-                "1y": 365, "2y": 730, "5y": 1825
-            }
+            days_map = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}
             days = days_map.get(period, 365)
             start_date = df.index.max() - pd.Timedelta(days=days)
             return df[df.index >= start_date]
 
-        # Slice for Chart
         chart_df = slice_period(df_analysis, chart_period)
         
-        # Fetch Benchmark (RSP) - We can also fetch this 'max' once
-        # Since we don't store bench_df in session, we fetch it 'max' here.
-        # Ideally fetcher caches this.
-        # with st.spinner("Loading Market Context..."):
-        #      bench_df = fetcher.fetch_ohlcv("RSP", period="max")
-        #      if not bench_df.empty:
-        #          bench_df = add_technical_features(bench_df)
-        #          # Slice to match chart range
-        #          if not chart_df.empty:
-        #              start_date = chart_df.index.min()
-        #              bench_df = bench_df[bench_df.index >= start_date]
-        
-        # USING PRE-FETCHED BENCHMARK
+        # Prepare Benchmark Plot Data
         bench_plot_df = pd.DataFrame()
         if not bench_df.empty:
-             if not chart_df.empty:
-                 start_date = chart_df.index.min()
-                 bench_plot_df = bench_df[bench_df.index >= start_date].copy()
-                    
-        if not chart_df.empty:
-            # --- Growth Index Calculation ---
-            st.write("") # Spacer
+             bench_plot_df = bench_df[bench_df.index.isin(chart_df.index)].copy()
+             # VISUAL TRICK: Normalize benchmark start price to match stock start price
+             # This makes the lines start at the same point so you can compare slope/performance easily.
+             if not bench_plot_df.empty and 'sma_200' in bench_plot_df.columns:
+                 s_start = chart_df['sma_50'].iloc[0] if 'sma_50' in chart_df.columns else chart_df['close'].iloc[0]
+                 b_start = bench_plot_df['sma_200'].iloc[0]
+                 if b_start > 0 and s_start > 0:
+                     ratio = s_start / b_start
+                     bench_plot_df['sma_200'] = bench_plot_df['sma_200'] * ratio
+        
+        # Render the Plotly Chart
+        with Timer("StockView:PlotChart"):
+            fig, last_cross_date = plot_stock_chart(chart_df, ticker, forecast_df, benchmark_df=bench_plot_df)
             
-            def get_growth_metrics(stock_df, market_df, col_name):
-                s_growth = 0.0
-                m_growth = 0.0
-                alp = 0.0
-                s_start_val = 0.0
-                f_valid_date = None
-                
-                # 1. Stock SMA Growth
-                if col_name in stock_df.columns:
-                    valid_s = stock_df[col_name].dropna()
-                    if not valid_s.empty:
-                        f_valid_date = valid_s.index[0]
-                        s_start_val = valid_s.iloc[0]
-                        s_end_val = valid_s.iloc[-1]
-                        if s_start_val > 0:
-                            s_growth = (s_end_val - s_start_val) / s_start_val
-                
-                # 2. Market SMA Growth (Aligned)
-                if not market_df.empty and col_name in market_df.columns and f_valid_date:
-                    bslice = market_df[market_df.index >= f_valid_date]
-                    valid_b = bslice[col_name].dropna()
-                    if not valid_b.empty:
-                        b_start = valid_b.iloc[0]
-                        b_end = valid_b.iloc[-1]
-                        if b_start > 0:
-                            m_growth = (b_end - b_start) / b_start
-                            
-                alp = s_growth - m_growth
-                return s_growth, m_growth, alp, s_start_val, f_valid_date
+        st.plotly_chart(fig, key=f"chart_{ticker}_{chart_period}", use_container_width=True)
+            
+        # --- SECTION: STRATEGY BACKTEST SIMULATION ---
+        st.markdown("### 🧬 Strategy Simulations")
+        
+        with Timer(f"Backtest:{ticker}:{chart_period}"):
+             # Run 3 variations of the strategy for comparison
+             # 1. Standard: Golden Cross (Risky)
+             sim_results = run_sma_strategy(chart_df, bench_df=bench_plot_df, investment_size=100000, trend_filter_sma200=False)
+             # 2. Safety: Only buy if SMA200 is rising (Conservative)
+             sim_safety = run_sma_strategy(chart_df, bench_df=bench_plot_df, investment_size=100000, trend_filter_sma200=True)
+             # 3. Strong: Only buy if trend is STRONG (>15% gap) (Aggressive)
+             sim_strong = run_sma_strategy(chart_df, bench_df=bench_plot_df, investment_size=100000, trend_filter_sma200=True, min_trend_strength=0.15)
 
-            # Calculate Metrics
-            g50_s, g50_m, g50_a, start_50, date_50 = get_growth_metrics(chart_df, bench_plot_df, 'sma_50')
-            g200_s, g200_m, g200_a, start_200, date_200 = get_growth_metrics(chart_df, bench_plot_df, 'sma_200')
-            
-            # Display Section 1: Medium Term (SMA50)
-            # Only show if SMA50 data exists (some stocks/IPOs might not have it)
-            if start_50 > 0:
-                c1, c2, c3 = st.columns(3)
-                c1.metric(f"{ticker} SMA50 Trend", f"{g50_s:+.2%}", help="Medium-term trend growth (50-day MA).")
-                c2.metric("S&P 500 SMA50 Trend", f"{g50_m:+.2%}")
-                c3.metric("Alpha (SMA50)", f"{g50_a:+.2%}", delta_color="normal" if g50_a >= 0 else "inverse")
-                
-                if g50_a > 0:
-                    alpha_banner.success(f"🚀 {ticker} is beating the market! (Positive SMA50 Alpha)")
-                else:
-                    alpha_banner.empty()
-            
-            # Display Section 2: Long Term (SMA200)
-            if start_200 > 0:
-                d1, d2, d3 = st.columns(3)
-                d1.metric(f"{ticker} SMA200 Trend", f"{g200_s:+.2%}", help="Long-term trend growth (200-day MA).")
-                d2.metric("S&P 500 SMA200 Trend", f"{g200_m:+.2%}")
-                # Prepare Plot Data (Benchmark Normalization)
-            bench_plot_df = pd.DataFrame() # fallback
-            if not bench_df.empty:
-                # Filter benchmark to match stock date range
-                bench_plot_df = bench_df[bench_df.index.isin(chart_df.index)].copy()
-                if not bench_plot_df.empty and 'sma_200' in bench_plot_df.columns:
-                    # Normalize bench SMA200 to start at same price as stock (visual comparison)
-                    s_start = start_200 # Stock SMA200 start price
-                    b_start = bench_plot_df['sma_200'].iloc[0]
-                    if b_start > 0 and s_start > 0:
-                        ratio = s_start / b_start
-                        bench_plot_df['sma_200'] = bench_plot_df['sma_200'] * ratio
-            
-            if start_200 > 0:
-                st.info(f"ℹ️ **Note on Chart vs Metrics**: The Purple Line (S&P Market Trend) is **VISUALLY SCALED** to start at {ticker}'s price (${start_200:.2f}) so you can compare the *slopes*. The 'Buy & Hold' metrics below show the **REAL** Index Price (~$180+).")
+        # Recommendation Badge
+        rec_action = "BUY" if sim_safety.get("is_active") else "SELL"
+        rec_color = "green" if rec_action == "BUY" else "red"
+        
+        st.markdown(f"""
+            <div style="text-align: right;">
+                <span style="background-color: {rec_color}; color: white; padding: 4px 12px; border-radius: 4px; font-weight: bold;">
+                    Recommendation: {rec_action}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Render Tabs for Simulation Results
+        tab1, tab2, tab3 = st.tabs(["Short Term Trend Buys", "Long Term Safety", "Strong but Safe (>15% Alpha)"])
+        
+        def render_sim_metrics(sim, rule_desc):
+            if not sim or sim.get("trade_count", 0) == 0:
+                st.info("No trades executed in this period.")
+                return
 
-            # Main Chart
-            with Timer("StockView:PlotChart"):
-                fig, last_cross_date = plot_stock_chart(chart_df, ticker, forecast_df, benchmark_df=bench_plot_df)
-                
-            # Display Last Golden Cross
-            if last_cross_date:
-                st.info(f"✨ **Last Golden Cross (SMA20 > SMA50)**: {last_cross_date.strftime('%Y-%m-%d')}")
+            sc1, sc2, sc3 = st.columns(3)
+            pnl = sim['total_pnl']
             
-            st.plotly_chart(fig, key=f"chart_{ticker}_{chart_period}")
-            
-            # --- RUN BACKTESTS ---
-            sim_bench_df = bench_plot_df 
-            
-            with Timer(f"Backtest:{ticker}:{chart_period}"):
-                 # 1. Short Term Trend (Standard)
-                 sim_results = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=False)
-                 # 2. Long Term Safety (Filtered)
-                 sim_safety = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=True)
-                 # 3. Strong but Safe (Filtered + Momentum)
-                 sim_strong = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=True, min_trend_strength=0.15)
-
-            with st.expander(f"Raw Data ({chart_period})"):
-                st.dataframe(chart_df.tail(10))
-            
-            # --- SIMULATION WIDGET ---
-            # Recommendation Logic (Safety Strategy)
-            rec_action = "BUY" if sim_safety.get("is_active") else "SELL"
-            rec_color = "green" if rec_action == "BUY" else "red"
-            
-            # Layout Header + Recommendation
-            sc1, sc2 = st.columns([3, 1])
+            # PnL Metric
             with sc1:
-                st.markdown("### 🧬 Strategy Simulations")
+                st.metric("Strategy PnL", f"${pnl:,.2f}") 
+                if pnl >= 0: st.success(f"{sim['trade_count']} Trades")
+                else: st.error(f"{sim['trade_count']} Trades")
+                    
+            # Compare vs Stock Buy & Hold
+            bh_stock = sim.get('bh_stock_pnl', 0.0)
             with sc2:
-                # Custom aligned badge
-                st.markdown(
-                    f"""
-                    <div style="text-align: right; padding-top: 10px;">
-                        <span style="background-color: {rec_color}; color: white; padding: 4px 12px; border-radius: 4px; font-weight: bold;">
-                            Recommendation: {rec_action}
-                        </span>
-                    </div>
-                    """, 
-                    unsafe_allow_html=True
-                )
+                diff = bh_stock - pnl 
+                st.metric("Buy & Hold (Stock)", f"${bh_stock:,.2f}", delta=f"{diff:+.2f} vs Strat", delta_color="normal")
+
+            # Compare vs Market Buy & Hold
+            bh_bench = sim.get('bh_bench_pnl', 0.0)
+            with sc3:
+                diff_bench = bh_bench - pnl
+                st.metric("Buy & Hold (S&P 500)", f"${bh_bench:,.2f}", delta=f"{diff_bench:+.2f} vs Strat", delta_color="normal")
             
-            tab1, tab2, tab3 = st.tabs(["Short Term Trend Buys", "Long Term Safety", "Strong but Safe (>15% Alpha)"])
+            st.caption(f"**Rules:** {rule_desc}.")
+            if sim.get('is_active'): st.warning("⚠️ Position Open")
             
-            def render_sim_metrics(sim, rule_desc):
-                if not sim or sim.get("trade_count", 0) == 0:
-                    st.info("No trades executed in this period.")
-                    return
-
-                sc1, sc2, sc3 = st.columns(3)
-                pnl = sim['total_pnl']
-                
-                # 1. Strategy PnL
-                with sc1:
-                    st.metric("Strategy PnL", f"${pnl:,.2f}", delta=None) 
-                    if pnl >= 0:
-                        st.success(f"{sim['trade_count']} Trades")
-                    else:
-                        st.error(f"{sim['trade_count']} Trades")
-                        
-                # 2. Buy & Hold (Stock)
-                bh_stock = sim.get('bh_stock_pnl', 0.0)
-                with sc2:
-                    diff = bh_stock - pnl 
-                    st.metric("Buy & Hold (Stock)", f"${bh_stock:,.2f}", delta=f"{diff:+.2f} vs Strat", delta_color="normal")
-                    s_buy = sim.get('bh_stock_buy', 0)
-                    s_sell = sim.get('bh_stock_sell', 0)
-                    st.caption(f"Buy: ${s_buy:.2f} ⮕ Sell: ${s_sell:.2f}")
-
-                # 3. Buy & Hold (S&P 500)
-                bh_bench = sim.get('bh_bench_pnl', 0.0)
-                with sc3:
-                    diff_bench = bh_bench - pnl
-                    st.metric("Buy & Hold (S&P 500 - RSP ETF)", f"${bh_bench:,.2f}", delta=f"{diff_bench:+.2f} vs Strat", delta_color="normal")
-                    b_buy = sim.get('bh_bench_buy', 0)
-                    b_sell = sim.get('bh_bench_sell', 0)
-                    st.caption(f"Buy: ${b_buy:.2f} ⮕ Sell: ${b_sell:.2f}")
-                
-                # Context Row
-                c_r1, c_r2 = st.columns([2, 1])
-                with c_r1:
-                     st.caption(f"**Rules:** {rule_desc}. Window: {sim['trades'][0]['buy_date'].strftime('%Y-%m-%d')} to {sim['trades'][-1]['sell_date'].strftime('%Y-%m-%d')}")
-                with c_r2:
-                     if sim.get('is_active'):
-                         st.warning("⚠️ Position Open")
-                     else:
-                         st.info("⚪ Position Closed")
-                
-                with st.expander("View Trade Log"):
-                    t_df = pd.DataFrame(sim['trades'])
-                    if not t_df.empty:
-                        st.dataframe(t_df, use_container_width=True)
-                st.divider()
-
-            with tab1:
-                render_sim_metrics(sim_results, "Buy \$100k @ Golden Cross, Sell All @ Death Cross")
-                
-            with tab2:
-                render_sim_metrics(sim_safety, "Buy $100k @ Golden Cross (IF SMA200 Rising), Sell All @ Death Cross")
-                
-            with tab3:
-                render_sim_metrics(sim_strong, "Buy $100k @ Golden Cross (IF SMA200 Rising AND SMA50 > SMA200 + 15%), Sell All @ Death Cross")
-        # 10. Log View (Moved here to capture Recommendation)
-        if "pressure_score" in dashboard_data:
-            strong_rec_action = "YES" if sim_strong.get("is_active") else "NO"
-            try:
-                # Instantiate tracker locally
-                t_tracker = ActivityTracker()
-                t_tracker.log_view(ticker, dashboard_data["pressure_score"], recommendation=rec_action, strong_rec=strong_rec_action)
-            except Exception as e:
-                # Fail silently in production
-                pass
-            
-            # --- News Feed (Moved here for context) ---
-            # Keeping News below charts or with Multi-Modal?
-            # User said "Multi-Modal Analysis ... sit above Price".
-            # News fits with Multi-Modal. But let's put it below charts as "Latest Info" 
-            # OR put it back in Multi-Modal section.
-            # I will put it at the very bottom of the Multi-Modal section (before charts).
-            
-            # (Insert News Feed back up?)
-            # Actually, let's keep it simple. Let's put News at the bottom of the page or in a sidebar?
-            # User didn't specify. I'll leave it out of the main flow for now or put it at the end.
-            
-            st.markdown("---")
-            st.subheader(f"Latest News Headlines ({len(news)})")
-            st.caption("Expanded coverage for AI contexts.")
-           
-            
-            with st.container(height=400):
-                for item in news:
-                     st.markdown(f"**[{item['title']}]({item['link']})**")
-                     st.caption(f"{item['publisher']} • {datetime.fromtimestamp(item['providerPublishTime']).strftime('%Y-%m-%d')}")
-                     st.write("---")
-
-            # --- Export for AI Deep Dive ---
-            with st.expander("🧠 Export for AI Deep Dive (Gemini/ChatGPT)", expanded=False):
-                st.caption("Copy this context and paste it into your favorite AI model to continue the conversation.")
-                
-                # Context Dict
-                indicators = {
-                    "rsi": dashboard_data.get("metrics", {}).get("rsi", "N/A"),
-                    "pressure_score": dashboard_data.get("pressure_score", "N/A")
-                }
-                
-                prompt_text = generate_deep_dive_prompt(ticker, df_analysis, news, indicators)
-                
-                st.code(prompt_text, language="markdown")
-                
-                def copy_to_clipboard(text):
-                    try:
-                        process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-                        process.communicate(input=text.encode('utf-8'))
-                        return True
-                    except Exception as e:
-                        print(f"Clipboard Error: {e}")
-                        return False
-
-                c_clip1, c_clip2 = st.columns(2)
-                with c_clip1:
-                    if st.button("📋 Copy & Open Gemini"):
-                        if copy_to_clipboard(prompt_text):
-                            st.toast("Copied to Clipboard! Opening Gemini...", icon="📋")
-                            webbrowser.open_new_tab("https://gemini.google.com/app")
-                        else:
-                            st.error("Clipboard access failed (pbcopy not found).")
-                            
-                with c_clip2:
-                    if st.button("📋 Copy & Open ChatGPT"):
-                        if copy_to_clipboard(prompt_text):
-                            st.toast("Copied to Clipboard! Opening ChatGPT...", icon="📋")
-                            webbrowser.open_new_tab("https://chat.openai.com/")
-                        else:
-                             st.error("Clipboard access failed.")
-            # --- Manage Portfolio Positions ---
-            st.write("---")
-            st.subheader("Manage Portfolio Positions")
-            
-            if 'portfolio_manager' in st.session_state:
-                pm = st.session_state.portfolio_manager
-                portfolios = [p for p in pm.list_portfolios() if p.status.value != "Archived"]
-                
-                if not portfolios:
-                    st.caption("No active portfolios found.")
-                
-                for p in portfolios:
-                    with st.container():
-                        st.markdown(f"**{p.name}**")
-                        current_qty = p.holdings.get(ticker, 0)
-                        
-                        if current_qty > 0:
-                            # HELD
-                            c_hold1, c_hold2 = st.columns([1, 2])
-                            with c_hold1:
-                                st.info(f"Held: {current_qty} shares")
-                            with c_hold2:
-                                if st.button(f"Remove/Sell All ({p.name})", key=f"rm_{p.id}_{ticker}"):
-                                    p.remove_ticker(ticker, last_price)
-                                    st.toast(f"Sold all named {ticker} from {p.name}")
-                                    st.rerun()
-                        
-                        st.caption(f"{'Increase' if current_qty > 0 else 'Add'} Position in {p.name}")
-                        cols = st.columns([1, 1, 1])
-                        with cols[0]:
-                            shares_add = st.number_input("Shares", min_value=1, value=10, key=f"sh_{p.id}_{ticker}")
-                        with cols[1]:
-                            cost_add = st.number_input("Price", value=float(last_price), key=f"pr_{p.id}_{ticker}")
-                        with cols[2]:
-                            btn_label = "Add" if current_qty == 0 else "Increase"
-                            if st.button(btn_label, key=f"add_{p.id}_{ticker}"):
-                                try:
-                                    p.update_holdings(ticker, shares_add, cost_add)
-                                    st.toast(f"Added {shares_add} {ticker} to {p.name}")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {e}")
-                        st.divider()
-
-
-
-    # --- Opportunity Discovery (Added) ---
-    st.divider()
-    st.subheader("🔍 Opportunity Discovery")
-    
-    # Get peers and competitors
-    rm = RelationshipManager()
-    info = rm.get_info(ticker) if ticker else None
-    
-    # Init data fetcher for details
-    # Reuse existing fetcher or create new instance (DataFetcher is already imported globally)
-    t_fetcher = DataFetcher()
-    t_tracker = ActivityTracker()
-
-    def render_opp_card(symbol, reason, key_suffix):
-        # Fetch details (cached)
-        try:
-            profile = t_fetcher.get_company_profile(symbol)
-        except: profile = {}
-        
-        # Fetch Rec
-        rec_state = t_tracker.get_ticker_state(symbol)
-        rec = rec_state.get("strategy_rec")
-        rec_val = "N/A"
-        rec_color = "gray"
-        
-        if rec == "BUY":
-            rec_val = "BUY"
-            rec_color = "green"
-        elif rec == "SELL":
-            rec_val = "SELL"
-            rec_color = "red"
-        
-        name = profile.get('name') or rm.database.get(symbol, {}).get("name", symbol)
-        industry = profile.get('industry') or rm.database.get(symbol, {}).get("industry", "Unknown")
-        sector = profile.get('sector') or rm.database.get(symbol, {}).get("sector", "Unknown")
-        desc = profile.get('summary') or profile.get('description', "No description available.")
-        
-        # Truncate description for "Products/Services"
-        short_desc = (desc[:150] + '...') if len(desc) > 150 else desc
-
-        with st.container():
-            # Layout: Ticker | Name | Industry | Products/Desc | Rec | Action
-            c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 2, 3, 1, 1])
-            with c1:
-                st.markdown(f"**{symbol}**")
-            with c2:
-                st.caption(name)
-            with c3:
-                st.caption(f"**{sector}**\n\n{industry}")
-            with c4:
-                st.caption(short_desc)
-            with c5:
-                if rec_val == "N/A":
-                    st.caption("N/A")
-                else: 
-                     st.markdown(f":{rec_color}[**{rec_val}**]")
-            with c6:
-                if st.button("🔍", key=f"analyze_opp_{symbol}_{key_suffix}", help=f"Analyze {symbol}"):
-                    st.session_state.analysis_ticker = symbol
-                    st.rerun()
+            with st.expander("View Trade Log"):
+                t_df = pd.DataFrame(sim['trades'])
+                if not t_df.empty:
+                    st.dataframe(t_df, use_container_width=True)
             st.divider()
 
-    if info:
-        t_peers, t_comps, t_graph = st.tabs(["Industry Peers", "Direct Competitors", "Network Graph"])
-        
-        # Headers
+        with tab1: render_sim_metrics(sim_results, "Buy \$100k @ Golden Cross, Sell All @ Death Cross")
+        with tab2: render_sim_metrics(sim_safety, "Buy $100k @ Golden Cross (IF SMA200 Rising), Sell All @ Death Cross")
+        with tab3: render_sim_metrics(sim_strong, "Buy $100k @ Golden Cross (IF SMA200 Rising AND SMA50 > SMA200 + 15%), Sell All @ Death Cross")
 
-        header_cols = st.columns([1, 2, 2, 3, 1, 1])
-        header_cols[0].markdown("**Ticker**")
-        header_cols[1].markdown("**Company**")
-        header_cols[2].markdown("**Industry/Sector**")
-        header_cols[3].markdown("**Products/Services**")
-        header_cols[4].markdown("**Rec**")
-        header_cols[5].markdown("**Act**")
-        st.divider()
-        
-        with t_peers:
-            peers = rm.get_industry_peers(ticker)
-            if peers:
-                for p in peers:
-                    render_opp_card(p, f"Peer in {info.get('industry')}", "peer")
-            else:
-                st.info("No industry peers found.")
-        
-        with t_comps:
-            comps = rm.get_competitors(ticker)
-            if comps:
-                for c in comps:
-                    render_opp_card(c, f"Competitor of {ticker}", "comp")
-            else:
-                st.info("No direct competitors listed.")
-                if st.button(f"🤖 AI: Find Competitors for {ticker}", key=f"ai_find_comp_{ticker}"):
-                     with st.spinner("Gemini is researching competitors..."):
-                         if rm.expand_knowledge(ticker):
-                             st.success("Competitors found!")
-                             st.rerun()
-                         else:
-                             st.error("Failed to find competitors. Usage Limit Exceeded (Daily Quota) or Invalid API Key.")
-                             
-        with t_graph:
-            st.caption("Visualizing the competitive landscape (Depth 2).")
+        # Log this view to update Recs in system
+        if "pressure_score" in dashboard_data:
+            strong_rec = "YES" if sim_strong.get("is_active") else "NO"
             try:
-                # Build DOT graph
-                dot = "digraph {"
-                dot += "rankdir=LR;" # Left to Right layout
-                dot += f'"{ticker}" [style=filled, fillcolor=lightblue];'
-                
-                # Level 1
-                l1_comps = rm.get_competitors(ticker)
-                for c1 in l1_comps:
-                    dot += f'"{ticker}" -> "{c1}";'
-                    
-                    # Level 2 (limit to avoid mesh mess)
-                    l2_comps = rm.get_competitors(c1)
-                    count = 0
-                    for c2 in l2_comps:
-                        if c2 != ticker and c2 not in l1_comps:
-                             dot += f'"{c1}" -> "{c2}" [style=dotted];'
-                             count += 1
-                             if count >= 3: break # Limit fan-out
-                
-                dot += "}"
-                st.graphviz_chart(dot)
-            except Exception as e:
-                st.info(f"Graph generation unsupported: {e}")
-    else:
-         if ticker:
-             col_miss1, col_miss2 = st.columns([3, 1])
-             with col_miss1:
-                 st.info(f"No relationship data found for {ticker}.")
-             with col_miss2:
-                 if st.button(f"✨ Expand Knowledge", key=f"ai_exp_stock_{ticker}"):
-                     with st.spinner(" researching..."):
-                         if rm.expand_knowledge(ticker):
-                             st.rerun()
+                t_tracker = ActivityTracker()
+                t_tracker.log_view(ticker, dashboard_data["pressure_score"], recommendation=rec_action, strong_rec=strong_rec)
+            except: pass
 
+        # --- SECTION: NEWS FEED ---
+        st.markdown("---")
+        st.subheader(f"Latest News Headlines ({len(news)})")
+        with st.container(height=400):
+            for item in news:
+                 st.markdown(f"**[{item['title']}]({item['link']})**")
+                 st.caption(f"{item['publisher']} • {datetime.fromtimestamp(item['providerPublishTime']).strftime('%Y-%m-%d')}")
+                 st.write("---")
 
+        # --- SECTION: OPPORTUNITY DISCOVERY (SPIDER MODE) ---
+        st.divider()
+        st.subheader("🔍 Opportunity Discovery")
+        
+        rm = RelationshipManager()
+        info = rm.get_info(ticker) if ticker else None
+        t_fetcher = DataFetcher()
+        t_tracker = ActivityTracker()
+
+        # Helper to render competitor cards
+        def render_opp_card(symbol, reason, key_suffix):
+            try: profile = t_fetcher.get_company_profile(symbol)
+            except: profile = {}
+            
+            rec_state = t_tracker.get_ticker_state(symbol)
+            rec = rec_state.get("strategy_rec", "N/A")
+            
+            name = profile.get('name') or rm.database.get(symbol, {}).get("name", symbol)
+            industry = profile.get('industry') or rm.database.get(symbol, {}).get("industry", "Unknown")
+            desc = profile.get('summary') or profile.get('description', "No description.")[:150]
+
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 3, 1])
+                c1.markdown(f"**{symbol}**")
+                c2.caption(name)
+                c3.caption(industry)
+                c4.caption(desc)
+                if st.button("🔍", key=f"analyze_{symbol}_{key_suffix}"):
+                    st.session_state.analysis_ticker = symbol
+                    st.rerun()
+                st.divider()
+
+        if info:
+            t_peers, t_comps, t_graph = st.tabs(["Industry Peers", "Direct Competitors", "Network Graph"])
+            
+            with t_peers:
+                peers = rm.get_industry_peers(ticker)
+                for p in peers: render_opp_card(p, "Peer", "peer")
+            
+            with t_comps:
+                comps = rm.get_competitors(ticker)
+                if comps:
+                    for c in comps: render_opp_card(c, "Competitor", "comp")
+                else:
+                    st.info("No competitors found in DB.")
+                    if st.button(f"🤖 AI: Find Competitors for {ticker}"):
+                         with st.spinner("Gemini is researching..."):
+                             if rm.expand_knowledge(ticker): st.rerun()
+                             else: st.error("Failed to find competitors.")
+            
+            with t_graph:
+                st.caption("Visualizing the competitive landscape.")
+                try:
+                    dot = "digraph { rankdir=LR; " + f'"{ticker}" [style=filled, fillcolor=lightblue];'
+                    l1_comps = rm.get_competitors(ticker)
+                    for c1 in l1_comps:
+                        dot += f'"{ticker}" -> "{c1}";'
+                    dot += "}"
+                    st.graphviz_chart(dot)
+                except: st.info("Graph viz not supported.")
+        else:
+             if st.button(f"✨ Expand Knowledge for {ticker}"):
+                 with st.spinner("Researching..."):
+                     if rm.expand_knowledge(ticker): st.rerun()

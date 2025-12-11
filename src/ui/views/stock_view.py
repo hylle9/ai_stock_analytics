@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import numpy as np
+import subprocess
+import webbrowser
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from src.data.ingestion import DataFetcher
@@ -16,6 +18,7 @@ from src.analytics.fusion import FusionEngine
 from src.analytics.gemini_analyst import GeminiAnalyst
 import plotly.express as px
 from src.analytics.insights import InsightManager
+from src.analytics.prompt_engineering import generate_deep_dive_prompt
 from src.analytics.activity import ActivityTracker
 from src.data.relationships import RelationshipManager
 from src.utils import defaults
@@ -246,10 +249,8 @@ def load_dashboard_data_v2(ticker: str):
         
         
         # 9. Technical Insight (Pattern Recognition)
-        # Strategy: Daily Cache (Standard "Technical" Report)
-        cached_to_tech = im.get_todays_insight(ticker, report_type="technical")
-        # DEFERRED: Generation moved to render_stock_view
-        data["technical_insight"] = cached_to_tech
+        # MOVED OUT OF CHACHE to allow instant refresh
+        data["technical_insight"] = None
 
     # 10. Tracker Log (Side effect) -> MOVED TO MAIN VIEW to capture Rec
     # try:
@@ -398,6 +399,7 @@ def plot_stock_chart(df, ticker, forecast=None, benchmark_df=None):
 
 
 
+
 def render_stock_view():
     st.header("Stock Analysis")
     
@@ -499,8 +501,9 @@ def render_stock_view():
                  st.rerun()
 
         # Fetch Dashboard Data
-        with Timer(f"StockView:LoadData:{ticker}"):
-             dashboard_data = load_dashboard_data_v2(ticker)
+        with st.spinner(f"Analyzing {ticker}..."):
+            with Timer(f"StockView:LoadData:{ticker}"):
+                dashboard_data = load_dashboard_data_v2(ticker)
         
         # Check if data loaded
         if dashboard_data['df_analysis'].empty: # Changed from 'main_df' to 'df_analysis'
@@ -558,14 +561,13 @@ def render_stock_view():
 
         # --- PRE-CALCULATE SIGNALS (Components unpacked above) ---
         # Re-construct some locals for UI logic
-        vol_acc = comps["vol_acc"]
-        rel_vol = comps["rel_vol"]
-        att_norm = comps["att_norm"]
-        cur_att = comps["cur_att"]
-        rsi = comps["rsi"]
+        vol_acc = comps.get("vol_acc", 0)
+        rel_vol = comps.get("rel_vol", 0)
+        att_norm = comps.get("att_norm", 0)
+        cur_att = comps.get("cur_att", 0)
+        rsi = comps.get("rsi", 50)
 
         # --- SECTION 1: MARKET PRESSURE (HERO) & MULTI-MODAL ANALYSIS ---
-        st.divider()
         st.subheader("Multi-Modal Analysis")
 
         # 1. Pressure Score Display (Prominent)
@@ -696,7 +698,9 @@ def render_stock_view():
         st.markdown("---")
         st.write("#### 🤖 Daily Technical Summary")
         
-        cached_insight = dashboard_data.get("technical_insight")
+        # Try to load fresh from DB (Bypass st.cache_data of main loader)
+        im = InsightManager()
+        cached_insight = im.get_todays_insight(ticker, report_type="technical")
         
         if cached_insight:
             st.success(f"Analysis from {datetime.now().strftime('%Y-%m-%d')} (Cached)")
@@ -707,9 +711,14 @@ def render_stock_view():
                 try:
                     analyst = GeminiAnalyst()
                     tech_report = analyst.analyze_technicals(ticker, df_analysis.tail(20))
-                    if "Error" not in tech_report:
+                    
+                    # DEBUG
+                    # st.write(f"DEBUG: Report Content -> {tech_report}")
+                    
+                    if "Error" not in tech_report and "unavailable" not in tech_report:
                         im.save_insight(ticker, tech_report, report_type="technical")
-                        st.markdown(tech_report)
+                        st.success("Analysis Generated & Saved! Refreshing...")
+                        st.rerun()
                     else:
                         st.warning(tech_report)
                 except Exception as e:
@@ -979,6 +988,45 @@ def render_stock_view():
                      st.caption(f"{item['publisher']} • {datetime.fromtimestamp(item['providerPublishTime']).strftime('%Y-%m-%d')}")
                      st.write("---")
 
+            # --- Export for AI Deep Dive ---
+            with st.expander("🧠 Export for AI Deep Dive (Gemini/ChatGPT)", expanded=False):
+                st.caption("Copy this context and paste it into your favorite AI model to continue the conversation.")
+                
+                # Context Dict
+                indicators = {
+                    "rsi": dashboard_data.get("metrics", {}).get("rsi", "N/A"),
+                    "pressure_score": dashboard_data.get("pressure_score", "N/A")
+                }
+                
+                prompt_text = generate_deep_dive_prompt(ticker, df_analysis, news, indicators)
+                
+                st.code(prompt_text, language="markdown")
+                
+                def copy_to_clipboard(text):
+                    try:
+                        process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+                        process.communicate(input=text.encode('utf-8'))
+                        return True
+                    except Exception as e:
+                        print(f"Clipboard Error: {e}")
+                        return False
+
+                c_clip1, c_clip2 = st.columns(2)
+                with c_clip1:
+                    if st.button("📋 Copy & Open Gemini"):
+                        if copy_to_clipboard(prompt_text):
+                            st.toast("Copied to Clipboard! Opening Gemini...", icon="📋")
+                            webbrowser.open_new_tab("https://gemini.google.com/app")
+                        else:
+                            st.error("Clipboard access failed (pbcopy not found).")
+                            
+                with c_clip2:
+                    if st.button("📋 Copy & Open ChatGPT"):
+                        if copy_to_clipboard(prompt_text):
+                            st.toast("Copied to Clipboard! Opening ChatGPT...", icon="📋")
+                            webbrowser.open_new_tab("https://chat.openai.com/")
+                        else:
+                             st.error("Clipboard access failed.")
             # --- Manage Portfolio Positions ---
             st.write("---")
             st.subheader("Manage Portfolio Positions")
@@ -1088,9 +1136,10 @@ def render_stock_view():
             st.divider()
 
     if info:
-        t_peers, t_comps = st.tabs(["Industry Peers", "Direct Competitors"])
+        t_peers, t_comps, t_graph = st.tabs(["Industry Peers", "Direct Competitors", "Network Graph"])
         
         # Headers
+
         header_cols = st.columns([1, 2, 2, 3, 1, 1])
         header_cols[0].markdown("**Ticker**")
         header_cols[1].markdown("**Company**")
@@ -1122,6 +1171,33 @@ def render_stock_view():
                              st.rerun()
                          else:
                              st.error("Failed to find competitors. Usage Limit Exceeded (Daily Quota) or Invalid API Key.")
+                             
+        with t_graph:
+            st.caption("Visualizing the competitive landscape (Depth 2).")
+            try:
+                # Build DOT graph
+                dot = "digraph {"
+                dot += "rankdir=LR;" # Left to Right layout
+                dot += f'"{ticker}" [style=filled, fillcolor=lightblue];'
+                
+                # Level 1
+                l1_comps = rm.get_competitors(ticker)
+                for c1 in l1_comps:
+                    dot += f'"{ticker}" -> "{c1}";'
+                    
+                    # Level 2 (limit to avoid mesh mess)
+                    l2_comps = rm.get_competitors(c1)
+                    count = 0
+                    for c2 in l2_comps:
+                        if c2 != ticker and c2 not in l1_comps:
+                             dot += f'"{c1}" -> "{c2}" [style=dotted];'
+                             count += 1
+                             if count >= 3: break # Limit fan-out
+                
+                dot += "}"
+                st.graphviz_chart(dot)
+            except Exception as e:
+                st.info(f"Graph generation unsupported: {e}")
     else:
          if ticker:
              col_miss1, col_miss2 = st.columns([3, 1])
@@ -1132,3 +1208,5 @@ def render_stock_view():
                      with st.spinner(" researching..."):
                          if rm.expand_knowledge(ticker):
                              st.rerun()
+
+

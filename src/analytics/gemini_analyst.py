@@ -32,12 +32,40 @@ class GeminiAnalyst:
 *   **Recommendation:** This is a generated placeholder to allow you to continue testing the UI flow without burning API quota.
 """
 
+    def _safe_get_text(self, response) -> str:
+        """Safely extracts text from the response, handling errors/blocks."""
+        try:
+             # Check if parts exist
+             if response.parts:
+                 return response.text
+             
+             # Check finish reason if no parts
+             # 1=STOP, 2=MAX_TOKENS, 3=SAFETY, 4=RECITATION, 5=OTHER
+             reason = "UNKNOWN"
+             if response.candidates and response.candidates[0].finish_reason:
+                 reason = str(response.candidates[0].finish_reason)
+                 
+             if reason == "3" or "SAFETY" in reason: # Safety
+                 return "⚠️ Insight unavailable: Content filtered by safety settings."
+             
+             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                 # Try manual reconstruction if .text fails but parts exist deep down
+                 return "".join([p.text for p in response.candidates[0].content.parts])
+                 
+             return f"⚠️ Insight unavailable (Empty Response). Finish Reason: {reason}"
+        except ValueError as e:
+            # Catch the specific "quick accessor" error
+            return f"⚠️ Insight generation failed: {str(e)}"
+        except Exception as e:
+            return f"⚠️ Insight generation error: {str(e)}"
+
     def _safe_generate(self, prompt: str, ticker: str) -> str:
         if not self.model:
             return "Configuration Required: Please add GOOGLE_API_KEY to your .env file."
             
         try:
-            return self.model.generate_content(prompt).text
+            response = self.model.generate_content(prompt)
+            return self._safe_get_text(response)
         except Exception as e:
             err = str(e)
             if "429" in err or "Quota" in err:
@@ -53,7 +81,7 @@ class GeminiAnalyst:
         """
         if not news_items:
             return "No recent news available to analyze."
-
+ 
         # Prepare context for prompt
         headlines = [f"- {item.get('title')} ({item.get('publisher')})" for item in news_items[:10]]
         headlines_text = "\n".join(headlines)
@@ -163,7 +191,7 @@ class GeminiAnalyst:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt)
-                return response.text
+                return self._safe_get_text(response)
             except Exception as e:
                 err_str = str(e)
                 # Fail fast on Rate Limits (Quota) to avoid burning retries on shared quota

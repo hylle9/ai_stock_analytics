@@ -129,9 +129,105 @@ def render_portfolio_view():
     m1.metric("Cash Balance", f"${portfolio.cash:,.2f}")
     m1.metric("Holdings Count", len(portfolio.holdings))
     
+    # To avoid clutter, let's put it below Metrics but above Holdings List
     st.divider()
     
-    # Holdings Management
+    # --- STRATEGY ANALYSIS ---
+    st.subheader("Accumulated Yearly Strategy Gains (Portfolio)")
+    st.caption("Simulate performance of your **exact held quantities** over the last 1 year.")
+    
+    from src.analytics.backtester import run_sma_strategy
+    
+    if st.button("RUN PORTFOLIO ANALYSIS 🚀", type="primary"):
+        p_fetcher = DataFetcher()
+        
+        # Benchmark
+        with st.spinner("Fetching Market Data..."):
+            p_bench_df = p_fetcher.fetch_ohlcv("RSP", period="1y")
+
+        # Accumulators
+        total_p1 = 0.0 # Short Term
+        total_p2 = 0.0 # Safety
+        total_p3 = 0.0 # Strong
+        total_bench = 0.0
+        
+        p_progress = st.progress(0)
+        p_status = st.empty()
+        p_log = []
+        
+        holdings_list = list(portfolio.holdings.items()) # [(ticker, qty), ...]
+        
+        for i, (ticker, qty) in enumerate(holdings_list):
+            p_status.text(f"Analyzing {ticker} ({qty} shares)...")
+            p_progress.progress((i + 1) / len(holdings_list))
+            
+            try:
+                # Use held qty
+                fixed_qty = int(qty)
+                
+                # Fetch
+                df = p_fetcher.fetch_ohlcv(ticker, period="1y")
+                
+                if not df.empty and len(df) > 50:
+                     if 'sma_20' not in df.columns:
+                        try:
+                            df['sma_20'] = df['close'].rolling(window=20).mean()
+                            df['sma_50'] = df['close'].rolling(window=50).mean()
+                            df['sma_200'] = df['close'].rolling(window=200).mean()
+                        except Exception as e:
+                            print(f"Error calc SMA for {ticker}: {e}")
+                        
+                     # Align Bench
+                     sim_bench = pd.DataFrame()
+                     if not p_bench_df.empty:
+                         sim_bench = p_bench_df[p_bench_df.index.isin(df.index)]
+                         
+                     # Run Strategies (Fixed Shares Mode)
+                     # 1
+                     s1 = run_sma_strategy(df, sim_bench, trend_filter_sma200=False, fixed_share_size=fixed_qty)
+                     # 2
+                     s2 = run_sma_strategy(df, sim_bench, trend_filter_sma200=True, fixed_share_size=fixed_qty)
+                     # 3
+                     s3 = run_sma_strategy(df, sim_bench, trend_filter_sma200=True, min_trend_strength=0.15, fixed_share_size=fixed_qty)
+                     
+                     total_p1 += s1.get("total_pnl", 0.0)
+                     total_p2 += s2.get("total_pnl", 0.0)
+                     total_p3 += s3.get("total_pnl", 0.0)
+                     total_bench += s1.get("bh_bench_pnl", 0.0)
+                     
+                     p_log.append({
+                         "Ticker": ticker,
+                         "Qty": fixed_qty,
+                         "Short Term": s1.get("total_pnl", 0.0),
+                         "Safety": s2.get("total_pnl", 0.0),
+                         "StrongSafe": s3.get("total_pnl", 0.0),
+                         "S&P500": s1.get("bh_bench_pnl", 0.0)
+                     })
+                else:
+                    st.warning(f"Insufficient data for {ticker} (Rows: {len(df)}). Strategy skipped.")
+
+            except Exception as e:
+                st.error(f"Error {ticker}: {e}")
+        
+        p_status.text("Analysis Complete!")
+        p_progress.empty()
+        
+        # Display Results
+        st.write(f"### 💰 Portfolio Gains (Based on Current Holdings)")
+        
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Short Term Trend", f"${total_p1:,.0f}")
+        pc2.metric("Long Term Safety", f"${total_p2:,.0f}", delta=f"{total_p2 - total_p1:,.0f}")
+        pc3.metric("Strong >15%", f"${total_p3:,.0f}", delta=f"{total_p3 - total_p1:,.0f}")
+        pc4.metric("Buy & Hold S&P500", f"${total_bench:,.0f}")
+        
+        with st.expander("Detailed Portfolio Breakdown"):
+             if p_log:
+                 st.dataframe(pd.DataFrame(p_log).style.format("${:,.0f}", subset=["Short Term", "Safety", "StrongSafe", "S&P500"]))
+             else:
+                 st.info("No strategies could be simulated for the current holdings (insufficient data or no holdings).")
+
+    st.divider()
     c_list, c_add = st.columns([2, 1])
     
     with c_list:

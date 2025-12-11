@@ -1,15 +1,10 @@
 import pandas as pd
 from typing import Dict, List, Any
 
-def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment_size: float = 100000.0, trend_filter_sma200: bool = False, min_trend_strength: float = 0.0) -> Dict[str, Any]:
+def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment_size: float = 100000.0, trend_filter_sma200: bool = False, min_trend_strength: float = 0.0, fixed_share_size: int = 0) -> Dict[str, Any]:
     """
     Simulates a Buy-and-Sell strategy based on SMA Crossovers.
-    Uses a FIXED CAPITAL approach (e.g. Invest $100,000 per trade).
-    Also calculates Buy & Hold benchmarks for the same period using the same initial capital.
-    
-    Args:
-        trend_filter_sma200: If True, only BUY if SMA200 is rising (Current > Prev).
-        min_trend_strength: Minimum % difference (alpha) between SMA50 and SMA200 (e.g. 0.15 = 15%).
+    Can use FIXED CAPITAL (invest $X) or FIXED SHARES (buy N shares).
     """
     results = {
         "total_pnl": 0.0,
@@ -20,7 +15,9 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
         "status_message": "No trades executed.",
         "bh_stock_pnl": 0.0,
         "bh_bench_pnl": 0.0,
-        "bh_bench_roi": 0.0
+        "bh_bench_roi": 0.0,
+        "fixed_shares": fixed_share_size,
+        "total_return": 0.0
     }
     
     # Check basic columns
@@ -29,8 +26,6 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
         
     # Check filter columns
     if trend_filter_sma200 and 'sma_200' not in df.columns:
-        # If filter requested but data missing, return empty or fallback? 
-        # Let's return empty to be safe.
         return results
 
     # Ensure chronological order
@@ -70,7 +65,6 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
         
         # 2. Delayed Entry (Safety Strategy)
         elif trend_filter_sma200 and (curr_20 > curr_50) and current_holding is None:
-            # We are in Golden Zone but not holding. Check if conditions improved.
              if sma200s is not None:
                  prev_200 = sma200s[i-1]
                  curr_200 = sma200s[i]
@@ -86,7 +80,6 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
 
         if buy_signal:
             # Check Trend Filter if Active (Applies to both Standard and Delayed)
-            # For Delayed, we essentially double-checked it above, but safe to standardize.
             is_valid_buy = True
             if trend_filter_sma200:
                 if sma200s is not None:
@@ -115,15 +108,20 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
                     is_valid_buy = False
 
             if is_valid_buy and current_holding is None:
-                # Calculate shares based on Fixed Capital
-                shares_to_buy = investment_size / float(price)
+                # Calculate shares based on Capital OR Fixed Size
+                if fixed_share_size > 0:
+                    shares_to_buy = float(fixed_share_size)
+                    capital_needed = shares_to_buy * float(price)
+                else:
+                    shares_to_buy = investment_size / float(price)
+                    capital_needed = investment_size
                 
                 current_holding = {
                     "type": "BUY",
                     "date": date,
                     "price": float(price),
                     "shares": shares_to_buy,
-                    "invested_capital": investment_size,
+                    "invested_capital": capital_needed,
                     "reason": buy_reason
                 }
                 
@@ -198,28 +196,43 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
     results["is_active"] = (current_holding is not None)
     results["status_message"] = f"Simulated PnL: ${total_pnl:,.2f} ({len(trades)} trades)"
     
-    # --- BENCHMARK COMPARISONS ---
-    # Fix: Use the FULL dataframe duration for Buy & Hold, not just Trade Duration.
-    # This ensures consistent benchmarks across different strategies.
+    # Calculate Strategy ROI
+    # Helper to track total capital employed or simply PnL / Initial
+    # Simplest: PnL / Initial Investment
+    if fixed_share_size > 0:
+        initial_invest = fixed_share_size * df['close'].iloc[0]
+    else:
+        initial_invest = investment_size
+        
+    if initial_invest > 0:
+        results["total_return"] = total_pnl / initial_invest
+        results["roi"] = results["total_return"]
     
-    start_date = df.index[0]
-    end_date = df.index[-1]
-    
-    # 1. Stock Buy & Hold (Invest $100k once at Start)
+    # --- BENCHMARK COMPARISONS (Buy & Hold) ---
     stock_start_price = df['close'].iloc[0]
     stock_end_price = df['close'].iloc[-1]
     
+    # 1. Stock Buy & Hold
     if stock_start_price > 0:
-        bh_stock_shares = investment_size / stock_start_price
+        if fixed_share_size > 0:
+            bh_stock_shares = float(fixed_share_size)
+            bh_inv_size = bh_stock_shares * stock_start_price
+        else:
+            bh_stock_shares = investment_size / stock_start_price
+            bh_inv_size = investment_size
+            
         bh_stock_final_value = bh_stock_shares * stock_end_price
-        results["bh_stock_pnl"] = bh_stock_final_value - investment_size
+        results["bh_stock_pnl"] = bh_stock_final_value - bh_inv_size
         results["bh_stock_buy"] = float(stock_start_price)
         results["bh_stock_sell"] = float(stock_end_price)
     
-    # 2. Benchmark Buy & Hold (Invest $100k once at Start)
+    # 2. Benchmark Buy & Hold (Equivalent Investment Amount)
+    # We use valid range benchmarks
+    start_date = df.index[0]
+    end_date = df.index[-1]
+    
     if bench_df is not None and not bench_df.empty:
         bench_df = bench_df.sort_index(ascending=True)
-        # Slicing is still good to ensure overlap
         b_slice = bench_df[(bench_df.index >= start_date) & (bench_df.index <= end_date)]
         
         if not b_slice.empty:
@@ -227,12 +240,16 @@ def run_sma_strategy(df: pd.DataFrame, bench_df: pd.DataFrame = None, investment
             b_end = b_slice.iloc[-1]['close']
             
             if b_start > 0:
-                bh_bench_shares = investment_size / b_start
+                # Use same investment size as Stock Buy & Hold (bh_inv_size)
+                # If fixed shares, investment size was fixed_share_size * stock_start_price
+                
+                # So here we invest that SAME DOLLAR AMOUNT into Benchmark
+                bh_bench_shares = bh_inv_size / b_start
                 bh_bench_final_value = bh_bench_shares * b_end
                 
-                results["bh_bench_pnl"] = bh_bench_final_value - investment_size
+                results["bh_bench_pnl"] = bh_bench_final_value - bh_inv_size
                 results["bh_bench_buy"] = float(b_start)
                 results["bh_bench_sell"] = float(b_end)
-                results["bh_bench_roi"] = (bh_bench_final_value - investment_size) / investment_size
+                results["bh_bench_roi"] = (bh_bench_final_value - bh_inv_size) / bh_inv_size
 
     return results

@@ -472,3 +472,82 @@ class RelationshipManager:
                     seen_peers.add(p)
                     
         return recs
+    def get_discovery_candidates(self, core_tickers: List[str], limit: int = 5, depth: int = 3) -> List[str]:
+        """
+        Finds 'neighbor' tickers (competitors) that are NOT in the core_tickers list.
+        Traverses the relationship graph up to `depth` levels.
+        """
+        if not core_tickers: return []
+        
+        known_universe = set(core_tickers)
+        candidates = set()
+        frontier = set(core_tickers)
+        
+        # Limit total traversal to avoid explosion, but keep high enough to find gems
+        traversal_limit = limit * 5 
+        
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                for d in range(depth):
+                    if not frontier: break
+                    
+                    # Batch Query for Frontier
+                    placeholders = ','.join(['?'] * len(frontier))
+                    query = f"""
+                        SELECT DISTINCT ticker_b 
+                        FROM dim_competitors 
+                        WHERE ticker_a IN ({placeholders})
+                    """
+                    rows = con.execute(query, list(frontier)).fetchall()
+                    
+                    new_frontier = set()
+                    for r in rows:
+                        t = r[0]
+                        if t and 1 <= len(t) <= 5 and " " not in t:
+                            if t not in known_universe:
+                                candidates.add(t)
+                                new_frontier.add(t)
+                                known_universe.add(t) # Mark as seen
+                    
+                    # Prepare next layer
+                    frontier = new_frontier
+                    
+                    if len(candidates) >= traversal_limit:
+                        break
+                        
+                # After gathering "depth" layers, sample down to requested limit
+                if len(candidates) > limit:
+                     import random
+                     return random.sample(list(candidates), limit)
+                return list(candidates)
+                
+            except Exception as e:
+                print(f"Discovery Error: {e}")
+            finally:
+                con.close()
+                
+        else:
+            # JSON Fallback (Iterative)
+            import random
+            frontier = set(core_tickers)
+            
+            for d in range(depth):
+                new_frontier = set()
+                for t in frontier:
+                    comps = self.get_competitors(t)
+                    for c in comps:
+                        if c not in known_universe:
+                            candidates.add(c)
+                            new_frontier.add(c)
+                            known_universe.add(c)
+                frontier = new_frontier
+                if not frontier: break
+            
+            # Sample
+            if candidates:
+                try:
+                    return random.sample(list(candidates), min(len(candidates), limit))
+                except: return list(candidates)
+                
+        return list(candidates)

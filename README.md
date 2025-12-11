@@ -65,6 +65,13 @@ Test your thesis before risking capital with our professional-grade backtester:
 *   **Delayed Entry Logic**: The Safety strategy features intelligent "Re-Entry" logic, ensuring you don't miss major bull runs just because the initial crossover was filtered out.
 *   **Actionable Signals**: Real-time "Buy" / "Sell" recommendations displayed directly on the dashboard based on the current strategy state.
 *   **Smart Benchmarking**: Apples-to-apples comparison against Buy & Hold (Stock) and the S&P 500 (Market) over the exact same time window.
+*   **Universe Analysis**: Run comprehensive yearly simulations across entire sectors to identify the most profitable strategies for a group of stocks.
+
+### 🕷️ 6. Spider Mode (Autonomous Discovery)
+The system doesn't just analyze what you tell it to; it actively expands its own knowledge graph.
+*   **Neighbor Discovery**: Automatically identifies competitors and supply chain partners of your core portfolio.
+*   **Recursive Crawling**: Configurable depth (Default: 3 hops) ensures the system finds hidden relationships through "friend-of-a-friend" networks.
+*   **Graph Visualization**: Interactive "Network Graph" in the UI visualizes these discovered connections.
 
 ### ⚙️ 3. Execution Modes
 The application supports multiple execution modes to suit your development or trading needs:

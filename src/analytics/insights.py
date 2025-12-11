@@ -82,7 +82,7 @@ class InsightManager:
                         print("✅ InsightManager: Cache Hit!")
                         return content
                     else:
-                        print("❌ InsightManager: Cache Expired.")
+                        print(f"❌ InsightManager: Cache Expired. Delta {delta} >= {valid_days}")
                 else:
                     print(f"❌ InsightManager: No cache found for {ticker} type={report_type}")
                 return None
@@ -129,6 +129,9 @@ class InsightManager:
                     INSERT INTO fact_ai_reports (report_id, ticker, date, report_type, content, model_used)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (rid, ticker, datetime.now().date(), report_type, content, model_used))
+                
+                # Explicit Commit
+                self.db.commit()
                 con.close()
                 print(f"✅ Saved AI Insight to DB for {ticker}")
                 return

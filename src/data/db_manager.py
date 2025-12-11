@@ -11,6 +11,10 @@ class DBManager:
     DATA_DIR = Config.DATA_CACHE_DIR
     DB_PATH = os.path.join(DATA_DIR, "market_data.duckdb")
     _SCHEMA_INITIALIZED = False
+    
+    # Singleton Connection to prevent Locking Issues
+    _SHARED_CONNECTION = None
+    _CONNECTION_READ_ONLY = False
 
     def __init__(self, read_only: bool = False):
         self.read_only = read_only
@@ -26,8 +30,46 @@ class DBManager:
                 print(f"⚠️ DB Schema Init Skipped (Persistence Check): {e}")
 
     def get_connection(self):
-        """Returns a new DuckDB connection."""
-        return duckdb.connect(self.DB_PATH, read_only=self.read_only)
+        """
+        Returns a CURSOR from the shared singleton connection.
+        Calling .close() on the returned object closes the cursor, not the connection.
+        """
+        # 1. Check if upgrade needed (RO -> RW)
+        if DBManager._SHARED_CONNECTION and (not self.read_only and DBManager._CONNECTION_READ_ONLY):
+            # We have RO, but need RW. Close and Reopen.
+            try:
+                DBManager._SHARED_CONNECTION.close()
+            except: pass
+            DBManager._SHARED_CONNECTION = None
+            
+        # 2. Establish Connection if None
+        if not DBManager._SHARED_CONNECTION:
+            try:
+                # Try requested mode
+                DBManager._SHARED_CONNECTION = duckdb.connect(self.DB_PATH, read_only=self.read_only)
+                DBManager._CONNECTION_READ_ONLY = self.read_only
+            except duckdb.IOException:
+                # If RW failed (Lock), try fallback to RO (if not already RO)
+                if not self.read_only:
+                    print("⚠️ DB Locked. Falling back to Read-Only Mode.")
+                    DBManager._SHARED_CONNECTION = duckdb.connect(self.DB_PATH, read_only=True)
+                    DBManager._CONNECTION_READ_ONLY = True
+                    # Update instance to reflect reality
+                    self.read_only = True
+                else:
+                    raise
+                    
+        # 3. Return Cursor
+        # DuckDB cursors are light-weight and thread-safe-ish context for execution
+        return DBManager._SHARED_CONNECTION.cursor()
+
+    def commit(self):
+        """Commits the current transaction on the shared connection."""
+        if DBManager._SHARED_CONNECTION:
+            try:
+                DBManager._SHARED_CONNECTION.commit()
+            except Exception as e:
+                print(f"DB Commit Error: {e}")
 
     def initialize_db(self):
         """Creates tables if they don't exist."""

@@ -20,6 +20,7 @@ import json
 from src.analytics.metrics import calculate_relative_volume, calculate_volume_acceleration
 from src.analytics.technical import add_technical_features
 from src.analytics.backtester import run_sma_strategy
+from src.data.relationships import RelationshipManager
 
 # --- CONFIGURATION ---
 LOG_FILE = os.path.join(Config.DATA_CACHE_DIR, "dcs_event.log")
@@ -77,6 +78,7 @@ def main():
         gemini = GeminiAnalyst()
         insights = InsightManager()
         pm = PortfolioManager()
+        rm = RelationshipManager()
     except Exception as e:
         print(f"❌ Failed to initialize components: {e}")
         return
@@ -114,6 +116,21 @@ def main():
         except Exception as e:
             print(f"⚠️ Portfolio Sync Error: {e}")
             
+        # --- 4. SPIDER MODE: Universe Discovery ---
+        try:
+            core_list = list(update_targets)
+            new_candidates = rm.get_discovery_candidates(core_list, limit=10, depth=Config.SPIDER_DEPTH)
+            if new_candidates:
+                print(f"🕷️ Spider Mode: Discovered {len(new_candidates)} new targets: {new_candidates}")
+                update_targets.update(new_candidates)
+                tracker.update_ticker_metadata("$DISCOVERY_LOG", {"last_batch": new_candidates, "ts": datetime.now().isoformat()})
+                
+                # Log it
+                for c in new_candidates:
+                    log_event(c, "DISCOVERY", "NEW_TARGET", "Relationship Expansion", "SPIDER")
+        except Exception as e:
+            print(f"Spider Error: {e}")
+
         # Convert to sorted list for consistent execution
         target_list = sorted(list(update_targets))
         
@@ -261,11 +278,7 @@ def main():
                 except Exception as e:
                     print(f"   ❌ Fusion Error: {e}")
 
-                # Pre-warm Profile Data (for UI descriptions)
-                try: 
-                    fetcher.get_company_profile(ticker)
-                except Exception as e_prof:
-                     pass
+                # [REMOVED DUPLICATE PROFILE FETCH AT LINE 266]
 
                 # --- F. GEMINI RESEARCH ---
                 try:

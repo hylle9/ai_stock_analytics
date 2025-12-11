@@ -22,6 +22,7 @@ class Config:
 
     # Feature Flags
     ENABLE_REAL_SENTIMENT = os.getenv("ENABLE_REAL_SENTIMENT", "True").lower() == "true"
+    SPIDER_DEPTH = int(os.getenv("SPIDER_DEPTH", "3"))
 
     @classmethod
     def validate(cls):

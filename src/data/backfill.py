@@ -55,20 +55,22 @@ def main():
     seeds = list(targets)
     expanded_targets = set(targets)
     
-    for seed in seeds:
-        # Get Competitors (Direct)
-        comps = rm.get_competitors(seed)
-        for c in comps:
-            formatted_c = c.upper().strip()
-            if formatted_c and formatted_c not in expanded_targets:
-                expanded_targets.add(formatted_c)
+    # Spider Mode Expansion
+    print(f"🕷️ Running Spider Mode (Depth={Config.SPIDER_DEPTH}) from {len(seeds)} seeds...")
+    try:
+        new_candidates = rm.get_discovery_candidates(seeds, limit=50, depth=Config.SPIDER_DEPTH)
+        if new_candidates:
+             print(f"   🕸️ Discovered {len(new_candidates)} deep connections: {new_candidates}")
+             expanded_targets.update(new_candidates)
+    except Exception as e:
+        print(f"Spider Error: {e}")
         
-        # Get Peers (Industry) - Limit 5
-        peers = rm.get_industry_peers(seed, limit=5)
-        for p in peers:
-             formatted_p = p.upper().strip()
-             if formatted_p and formatted_p not in expanded_targets:
-                 expanded_targets.add(formatted_p)
+    # Manual Peer Fallback - DISABLED to avoid Rate Limits (429) during backfill
+    # for seed in seeds:
+    #      peers = rm.get_industry_peers(seed, limit=3)
+    #      for p in peers:
+    #          if p and p not in expanded_targets:
+    #              expanded_targets.add(p)
 
     target_list = sorted(list(expanded_targets))
     # Filter pollution

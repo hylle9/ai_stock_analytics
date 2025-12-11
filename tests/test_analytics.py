@@ -77,3 +77,61 @@ class TestAnalytics:
         result = run_sma_strategy(df, trend_filter_sma200=True)
         
         assert result['is_active'] is False # Should be Cash
+
+    def test_sma_strong_trend_filter(self):
+        """
+        Test 'Strong' filter where SMA50 must be > SMA200 by a margin (e.g. 15%).
+        """
+        # Case A: SMA50 > SMA200 but WEAK (<10%)
+        # SMA50=105, SMA200=100 -> 5% diff.
+        data_weak = {
+            'close': [110, 110, 110],
+            'sma_50': [105, 105, 105],
+            'sma_20': [108, 108, 108], # > 50, so normally BUY
+            'sma_200': [100, 100, 100],
+            'rsi': [60, 60, 60]
+        }
+        df_weak = pd.DataFrame(data_weak)
+        
+        # Should be filtered out because 5% < 15%
+        res_weak = run_sma_strategy(df_weak, trend_filter_sma200=True, min_trend_strength=0.15)
+        assert res_weak['is_active'] is False
+        
+        # Case B: SMA50 > SMA200 STRONG (>15%)
+        # SMA50=120, SMA200=100 -> 20% diff.
+        # MUST BE RISING to trigger Delayed Entry if not a fresh crossover
+        # Or we can simulate a fresh crossover.
+        # Let's simulate delayed entry: SMA20 > SMA50 already, AND Rising
+        data_strong = {
+            'close': [128, 129, 130],
+            'sma_50': [118, 119, 120],  # Rising
+            'sma_20': [123, 124, 125],  # Rising and > SMA50
+            'sma_200': [98, 99, 100],   # Rising
+            'rsi': [60, 60, 60]
+        }
+        df_strong = pd.DataFrame(data_strong)
+        
+        res_strong = run_sma_strategy(df_strong, trend_filter_sma200=True, min_trend_strength=0.15)
+        assert res_strong['is_active'] is True
+
+    def test_backtest_accumulated_return(self):
+        """
+        Verify that the strategy returns a 'total_return' figure.
+        """
+        # Simple profitable trade: Buy at 100, Hold, Price goes to 110
+        data = {
+            'close': [100, 100, 110],
+            'sma_50': [90, 90, 90],
+            'sma_20': [85, 95, 95], # Crosses 90: Index 0 (85) < 90, Index 1 (95) > 90
+            'sma_200': [80, 80, 80],
+            'rsi': [50, 50, 50]
+        }
+        df = pd.DataFrame(data)
+        
+        res = run_sma_strategy(df, trend_filter_sma200=False)
+        
+        # Check returns exist
+        assert 'total_return' in res
+        # Return should be positive (approx 10%)
+        # Note: Backtester accumulates realized + unrealized
+        assert res['total_return'] > 0.05

@@ -83,6 +83,8 @@ class ActivityTracker:
                     # Ensure asset
                     con.execute("INSERT OR IGNORE INTO dim_assets (ticker) VALUES (?)", (ticker,))
                     con.execute("INSERT INTO fact_user_interactions (interaction_id, ticker, interaction_type) VALUES (?, ?, 'LIKE')", (iid, ticker))
+                
+                self.db.commit()
             except Exception as e:
                 print(f"DB Like Error: {e}")
             finally:
@@ -223,6 +225,9 @@ class ActivityTracker:
                     INSERT INTO fact_user_interactions (interaction_id, ticker, interaction_type, metadata)
                     VALUES (?, ?, 'VIEW', ?)
                  """, (iid, ticker, meta))
+                 
+                 # Explicit Commit
+                 self.db.commit()
             except Exception as e:
                 print(f"DB Log View Error: {e}")
             finally:
@@ -253,19 +258,28 @@ class ActivityTracker:
             # Simplified: Just Get Top Viewed Recently
             con = self.db.get_connection()
             try:
-                # Count views in last 7 days
+                # Improved Query: Get distinct tickers updated in last 24h
+                # This ensures we capture DCS 'Spider' discoveries which are logged as VIEWs
+                # Limit 50 to keep the loop fast, but sort by Timestamp DESC (Newest) first to catch latest
                 rows = con.execute("""
-                    SELECT ticker, COUNT(*) as views 
+                    SELECT DISTINCT ticker
                     FROM fact_user_interactions 
                     WHERE interaction_type='VIEW' 
-                      AND timestamp > (CURRENT_DATE - INTERVAL 7 DAY)
-                    GROUP BY ticker 
-                    ORDER BY views DESC 
-                    LIMIT ?
-                """, (limit,)).fetchall()
+                      AND timestamp > (CURRENT_TIMESTAMP - INTERVAL '24 HOURS')
+                      AND ticker NOT LIKE 'SYN%'
+                      AND ticker NOT LIKE '$%'
+                    ORDER BY timestamp DESC
+                    LIMIT 60
+                """).fetchall()
                 
                 results = []
-                for (t, v) in rows:
+                for (t,) in rows:
+                    if not t: continue
+                    t_clean = t.strip().upper()
+                    # Strict Filter: No Systems, No Synthetics, No empty
+                    if t_clean.startswith("$") or t_clean.startswith("SYN"): 
+                        continue
+
                     # Get history scores
                     scores_res = con.execute("""
                         SELECT metadata FROM fact_user_interactions 
@@ -337,6 +351,9 @@ class ActivityTracker:
         top_100_tickers = [t for t, _ in view_counts.most_common(100)]
         results = []
         for ticker in top_100_tickers:
+            t_clean = ticker.strip().upper()
+            if t_clean.startswith("$") or t_clean.startswith("SYN"): continue
+            
             diff = self._calculate_rising_diff(ticker, history, sorted_days)
             current_score = 0.0
             for day in sorted_days:
@@ -369,6 +386,8 @@ class ActivityTracker:
                     INSERT INTO fact_user_interactions (interaction_id, ticker, interaction_type, metadata)
                     VALUES (?, ?, 'VIEW', ?)
                  """, (iid, ticker, meta_json))
+                 
+                 self.db.commit()
             except Exception as e:
                 print(f"DB Metadata Update Error: {e}")
             finally:

@@ -210,3 +210,28 @@ class DBManager:
             print(f"DB Origin Update Error: {e}")
         finally:
             con.close()
+    def add_asset(self, ticker: str, name: str = None, sector: str = None, industry: str = None, description: str = None):
+        """
+        Upserts asset information into dim_assets.
+        """
+        con = self.get_connection()
+        try:
+            # Check if exists to preserve fields if partial update?
+            # For now, simple UPSERT preferring new non-null values.
+            # Using INSERT OR REPLACE overwrites everything. 
+            # Better: ON CONFLICT UPDATE
+            
+            con.execute("""
+                INSERT INTO dim_assets (ticker, name, sector, industry, description)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    name = COALESCE(EXCLUDED.name, dim_assets.name),
+                    sector = COALESCE(EXCLUDED.sector, dim_assets.sector),
+                    industry = COALESCE(EXCLUDED.industry, dim_assets.industry),
+                    description = COALESCE(EXCLUDED.description, dim_assets.description)
+            """, (ticker, name, sector, industry, description))
+            
+        except Exception as e:
+            print(f"DB Add Asset Error: {e}")
+        finally:
+            con.close()

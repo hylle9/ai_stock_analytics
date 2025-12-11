@@ -5,6 +5,7 @@ from src.models.portfolio import Portfolio, PortfolioManager, PortfolioStatus, O
 from src.models.decision import Recommender
 from src.data.universe import UniverseManager
 from src.data.ingestion import DataFetcher
+from src.analytics.activity import ActivityTracker
 
 def initialize_portfolio_manager():
     if 'portfolio_manager' not in st.session_state or not hasattr(st.session_state.portfolio_manager, 'save_portfolio'):
@@ -135,14 +136,24 @@ def render_portfolio_view():
     
     with c_list:
         st.subheader("Current Holdings")
+        
+        # Init Tracker
+        tracker = ActivityTracker()
+
         if portfolio.holdings:
             # Create display DF
             holdings_data = []
             for t, qty in portfolio.holdings.items():
                 price = current_prices.get(t, 0)
                 val = qty * price
+                
+                # Fetch Rec
+                state = tracker.get_ticker_state(t)
+                rec = state.get("strategy_rec", "N/A")
+                
                 holdings_data.append({
                     "Ticker": t,
+                    "Rec": rec,
                     "Qty": qty,
                     "Price": f"${price:,.2f}",
                     "Value": f"${val:,.2f}",
@@ -151,18 +162,38 @@ def render_portfolio_view():
             
             hdf = pd.DataFrame(holdings_data)
             
-            # Using columns for layout to add delete buttons manually since st.dataframe is read-only for now
+            # HEADER ROW
+            h1, h2, h3, h4, h5, h6 = st.columns([1, 1, 1, 1, 1, 1])
+            h1.markdown("**Ticker**")
+            h2.markdown("**Rec**")
+            h3.markdown("**Qty**")
+            h4.markdown("**Price**")
+            h5.markdown("**Value**")
+            h6.markdown("**Action**")
+            st.divider()
+
             # Custom table rendering
             for _, row in hdf.iterrows():
-                cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 1])
+                cc1, cc2, cc3, cc4, cc5, cc6 = st.columns([1, 1, 1, 1, 1, 1])
                 cc1.write(f"**{row['Ticker']}**")
-                cc2.write(f"{row['Qty']}")
-                cc3.write(row['Price'])
-                cc4.write(row['Value'])
-                if cc5.button("Sell All", key=f"sell_{row['Ticker']}"):
+                
+                # Rec Badge
+                r_val = row['Rec']
+                if r_val == "BUY":
+                    cc2.markdown(":green[**BUY**]")
+                elif r_val == "SELL":
+                    cc2.markdown(":red[**SELL**]")
+                else:
+                    cc2.caption("N/A")
+
+                cc3.write(f"{row['Qty']}")
+                cc4.write(row['Price'])
+                cc5.write(row['Value'])
+                if cc6.button("Sell All", key=f"sell_{row['Ticker']}"):
                     portfolio.remove_ticker(row['Ticker'], current_prices.get(row['Ticker'], 0))
                     pm.save_portfolio(portfolio)
                     st.rerun()
+            st.divider()
         else:
             st.info("No holdings. Add some assets!")
 

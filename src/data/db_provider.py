@@ -329,7 +329,7 @@ class DuckDBProvider(BaseDataProvider):
         finally:
             con.close()
 
-    def add_asset(self, ticker: str, name: str = "", sector: str = "", industry: str = ""):
+    def add_asset(self, ticker: str, name: str = "", sector: str = "", industry: str = "", description: str = ""):
          con = self.db.get_connection()
          try:
              # Update metadata if provided
@@ -345,6 +345,9 @@ class DuckDBProvider(BaseDataProvider):
                  if industry:
                      updates.append("industry = ?")
                      params.append(industry)
+                 if description:
+                     updates.append("description = ?")
+                     params.append(description)
                      
                  if updates:
                      sql = "UPDATE dim_assets SET " + ", ".join(updates) + " WHERE ticker = ?"
@@ -352,8 +355,8 @@ class DuckDBProvider(BaseDataProvider):
                      con.execute(sql, params)
              
              # Ensure existence
-             con.execute("INSERT OR IGNORE INTO dim_assets (ticker, name, sector, industry) VALUES (?, ?, ?, ?)", 
-                        (ticker, name or ticker, sector or "Unknown", industry or "Unknown"))
+             con.execute("INSERT OR IGNORE INTO dim_assets (ticker, name, sector, industry, description) VALUES (?, ?, ?, ?, ?)", 
+                        (ticker, name or ticker, sector or "Unknown", industry or "Unknown", description or ""))
          finally:
              con.close()
 

@@ -59,6 +59,13 @@ Our proprietary scoring system quantifies the directional energy of a stock. It 
 *   🟡 **40-70 (Neutral)**: Consolidation / Holding pattern.
 *   🔴 **< 40 (Weakness)**: Sell / Avoid zone. Price is likely below SMA200 with negative sentiment.
 
+### 🧬 5. Multi-Strategy Simulation Engine
+Test your thesis before risking capital with our professional-grade backtester:
+*   **Dual-Strategy Comparison**: Compare "Aggressive" (Short-Term Trend) vs. "Conservative" (Long-Term Safety) strategies side-by-side.
+*   **Delayed Entry Logic**: The Safety strategy features intelligent "Re-Entry" logic, ensuring you don't miss major bull runs just because the initial crossover was filtered out.
+*   **Actionable Signals**: Real-time "Buy" / "Sell" recommendations displayed directly on the dashboard based on the current strategy state.
+*   **Smart Benchmarking**: Apples-to-apples comparison against Buy & Hold (Stock) and the S&P 500 (Market) over the exact same time window.
+
 ### ⚙️ 3. Execution Modes
 The application supports multiple execution modes to suit your development or trading needs:
 *   **Production Mode (`--production`)**: Strict live data enforcement. No mock data. intended for actual decision making.

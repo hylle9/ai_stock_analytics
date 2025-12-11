@@ -37,7 +37,10 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df['bb_low'] = bollinger.bollinger_lband()
     
     # Volatility (ATR)
-    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
+    try:
+        df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
+    except (IndexError, ValueError):
+        df['atr'] = np.nan
     
     # Returns
     df['log_return'] = pd.Series(df['close']).pct_change().apply(lambda x: np.log(1 + x))

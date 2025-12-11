@@ -62,7 +62,7 @@ class DataFetcher:
         if Config.DATA_STRATEGY in ["LIVE", "PRODUCTION"]:
              # 0. Smart Cache Optimization
              # Even in Live Mode, if we have "Fresh" data in DB, use it.
-             if self.db:
+             if self.db and use_cache:
                  try:
                      with Timer(f"SmartCheck::{ticker}"):
                          # Check in-memory cache first, then fall back to DB query
@@ -640,9 +640,18 @@ class DataFetcher:
         if Config.USE_SYNTHETIC_DB and self.db:
             try:
                 # We can reuse fetch_key_metrics logic via DB or check dim_assets
-                # fetch_key_metrics returns {pe, market_cap, sector, industry, name}
+                # fetch_key_metrics returns {pe, market_cap, sector, industry, name, description}
                 db_profile = self.db.fetch_key_metrics(ticker)
+                
+                # If we have basic info but no description, we might want to fetch fresh? 
+                # For now, return if name exists.
                 if db_profile and db_profile.get('name'):
+                    # Ensure description is there
+                    if not db_profile.get('description'):
+                        # If DB row exists but desc is missing, we might want to let it fall through to live?
+                        # But that forces API call. Let's return it and rely on background update.
+                        pass
+                        
                     db_profile["_source"] = "🟠 CACHE (DB)"
                     return db_profile
             except Exception as e:
@@ -660,7 +669,8 @@ class DataFetcher:
                        ticker, 
                        name=profile.get("name", ""), 
                        sector=profile.get("sector", ""), 
-                       industry=profile.get("industry", "")
+                       industry=profile.get("industry", ""),
+                       description=profile.get("description", "")
                    )
                 if profile: profile["_source"] = "🟢 LIVE"
             except Exception as e:

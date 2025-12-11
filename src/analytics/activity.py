@@ -142,7 +142,20 @@ class ActivityTracker:
                             avg_prev = sum(prev_window) / len(prev_window)
                             diff = current_score - avg_prev
                             
-                    results.append({"ticker": t, "pressure_score": current_score, "rising_diff": diff})
+                    if history_scores:
+                        latest_meta_json = scores_res[0][0]
+                        try:
+                             rec = json.loads(latest_meta_json).get("strategy_rec", "Unknown")
+                        except: rec = "Unknown"
+                    else:
+                        rec = "Unknown"
+
+                    results.append({
+                        "ticker": t, 
+                        "pressure_score": current_score, 
+                        "rising_diff": diff,
+                        "strategy_rec": rec
+                    })
             except Exception as e:
                 print(f"DB Get Likes Error: {e}")
             finally:
@@ -155,14 +168,22 @@ class ActivityTracker:
         
         for ticker in self.data["likes"]:
             current_score = 0.0
+            rec = "Unknown"
+            s_rec = "NO"
+            
             for day in sorted_days:
                 if ticker in history[day]:
-                    current_score = history[day][ticker]["score"]
+                    entry = history[day][ticker]
+                    current_score = entry["score"]
+                    rec = entry.get("strategy_rec", "Unknown")
+                    s_rec = entry.get("strong_rec", "NO")
                     break
             results.append({
                 "ticker": ticker,
                 "pressure_score": current_score,
-                "rising_diff": self._calculate_rising_diff(ticker, history, sorted_days)
+                "rising_diff": self._calculate_rising_diff(ticker, history, sorted_days),
+                "strategy_rec": rec,
+                "strong_rec": s_rec
             })
         return results
 
@@ -184,7 +205,7 @@ class ActivityTracker:
             
         return current_score - avg_prev
 
-    def log_view(self, ticker: str, pressure_score: float):
+    def log_view(self, ticker: str, pressure_score: float, recommendation: str = None, strong_rec: str = None):
         if self.read_only: return
 
         if Config.USE_SYNTHETIC_DB and self.db:
@@ -192,7 +213,11 @@ class ActivityTracker:
             try:
                  import uuid
                  iid = str(uuid.uuid4())
-                 meta = json.dumps({"score": float(pressure_score)})
+                 meta_dict = {"score": float(pressure_score)}
+                 if recommendation: meta_dict["strategy_rec"] = recommendation
+                 if strong_rec: meta_dict["strong_rec"] = strong_rec
+                 meta = json.dumps(meta_dict)
+                 
                  con.execute("INSERT OR IGNORE INTO dim_assets (ticker) VALUES (?)", (ticker,))
                  con.execute("""
                     INSERT INTO fact_user_interactions (interaction_id, ticker, interaction_type, metadata)
@@ -219,6 +244,8 @@ class ActivityTracker:
         entry = history[today][ticker]
         entry["views"] += 1
         entry["score"] = float(pressure_score) 
+        if recommendation: entry["strategy_rec"] = recommendation
+        if strong_rec: entry["strong_rec"] = strong_rec
         self._save_data()
 
     def get_rising_pressure_stocks(self, limit: int = 12) -> list:
@@ -265,7 +292,25 @@ class ActivityTracker:
                             avg_prev = sum(prev_window) / len(prev_window)
                             diff = current_score - avg_prev
                             
-                    results.append({"ticker": t, "pressure_score": current_score, "rising_diff": diff})
+                    if scores_res:
+                        try:
+                            l_meta = json.loads(scores_res[0][0])
+                            rec = l_meta.get("strategy_rec", "Unknown")
+                            s_rec = l_meta.get("strong_rec", "NO")
+                        except: 
+                            rec = "Unknown"
+                            s_rec = "NO"
+                    else: 
+                        rec = "Unknown"
+                        s_rec = "NO"
+
+                    results.append({
+                        "ticker": t, 
+                        "pressure_score": current_score, 
+                        "rising_diff": diff,
+                        "strategy_rec": rec,
+                        "strong_rec": s_rec
+                    })
                 
                 # Sort by Momentum (Descending)
                 results.sort(key=lambda x: x["rising_diff"], reverse=True)
@@ -381,4 +426,33 @@ class ActivityTracker:
             # Let's adjust JSON return to be consistent if possible, or accept just score.
             return {"score": entry.get("score", 50.0), "status": "UNKNOWN"}
             
+        return {}
+
+    def get_ticker_state(self, ticker: str) -> dict:
+        """
+        Retrieves the latest state (metadata) for a ticker.
+        Key fields: pressure_score, strategy_rec.
+        """
+        if Config.USE_SYNTHETIC_DB and self.db:
+            con = self.db.get_connection()
+            try:
+                res = con.execute("""
+                    SELECT metadata 
+                    FROM fact_user_interactions 
+                    WHERE ticker=? AND interaction_type='VIEW' 
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (ticker,)).fetchone()
+                
+                if res and res[0]:
+                    return json.loads(res[0])
+            except: pass
+            finally: con.close()
+            return {}
+            
+        # JSON Mode
+        history = self.data["history"]
+        sorted_days = sorted(history.keys(), reverse=True)
+        for day in sorted_days:
+            if ticker in history[day]:
+                return history[day][ticker] # Might only have score/views in legacy mode
         return {}

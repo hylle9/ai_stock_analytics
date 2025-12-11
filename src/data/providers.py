@@ -181,7 +181,8 @@ class AlphaVantageProvider(BaseDataProvider):
             'eps': float(data.get("EPS", 0) if data.get("EPS") and data.get("EPS") != "None" else 0),
             'sector': data.get("Sector", "Unknown"),
             'industry': data.get("Industry", "Unknown"),
-            'name': data.get("Name", ticker)
+            'name': data.get("Name", ticker),
+            'description': data.get("Description", "")
         }
 
     def search_assets(self, query: str) -> list:
@@ -282,7 +283,8 @@ class YFinanceProvider(BaseDataProvider):
                 'eps': info.get('trailingEps', 0),
                 'sector': info.get('sector', 'Unknown'),
                 'industry': info.get('industry', 'Unknown'),
-                'name': info.get('shortName') or info.get('longName', ticker)
+                'name': info.get('shortName') or info.get('longName', ticker),
+                'description': info.get('longBusinessSummary') or info.get('description') or ""
             }
         except Exception as e:
             print(f"YF Metrics error: {e}")

@@ -10,6 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 from src.ui.views.universe_view import render_universe_view
 from src.ui.views.stock_view import render_stock_view
 from src.ui.views.risk_view import render_risk_view
+from src.ui.views.robo_view import render_robo_view
 from src.ui.views.portfolio_view import render_portfolio_view, initialize_portfolio_manager
 
 from src.models.portfolio import PortfolioManager, PortfolioStatus
@@ -69,7 +70,7 @@ def main():
     if "navigation_page" not in st.session_state:
         st.session_state.navigation_page = "Dashboard"
         
-    page = st.sidebar.radio("Navigation", ["Dashboard", "Stock Analysis", "Risk Dashboard", "Portfolio & Robo-Advisor", "Universe Management"], key="navigation_page")
+    page = st.sidebar.radio("Navigation", ["Dashboard", "Stock Analysis", "Risk Dashboard", "Portfolio Management", "Robo Advisor", "Universe Management"], key="navigation_page")
     
     if page == "Dashboard":
         st.title("Market Dashboard")
@@ -152,7 +153,17 @@ def main():
                     
                     with l_cols[idx % 4]:
                         with st.container():
-                            st.markdown(f"**{ticker}**")
+                            # Strategy Badge
+                            rec = fav.get("strategy_rec", "Unknown")
+                            rec_html = ""
+                            if rec == "BUY":
+                                rec_html = " <span style='background-color:green; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>BUY</span>"
+                            elif rec == "SELL":
+                                rec_html = " <span style='background-color:red; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>SELL</span>"
+                            else:
+                                rec_html = f" <span style='background-color:grey; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>{rec}</span>"
+                                
+                            st.markdown(f"**{ticker}**{rec_html}", unsafe_allow_html=True)
                             
                             score = fav['pressure_score']
                             diff = fav['rising_diff']
@@ -194,10 +205,31 @@ def main():
             st.subheader("📈 Rising Stock Pressure")
             st.caption("Top viewed stocks sorted by momentum (Current Score vs 3-Day Avg)")
             
+            # Filter Controls
+            f_mode = st.radio(
+                "Filter Recommendations:",
+                ["All", "Buy & Strong Buy", "Strong Buy Only"],
+                index=0,
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+
+            filtered_rising = []
+            if f_mode == "All":
+                filtered_rising = rising_stocks
+            elif f_mode == "Buy & Strong Buy":
+                # BUY or Strong Buy (Assuming Strong implies Strategy Rec=BUY)
+                filtered_rising = [s for s in rising_stocks if s.get("strategy_rec") == "BUY"]
+            elif f_mode == "Strong Buy Only":
+                filtered_rising = [s for s in rising_stocks if s.get("strong_rec") == "YES"]
+
+            if not filtered_rising:
+                st.info("No stocks match the selected filter.")
+            
             # Grid layout
             f_cols = st.columns(4)
             with Timer("Render:Rising"):
-                for idx, fav in enumerate(rising_stocks):
+                for idx, fav in enumerate(filtered_rising):
                     ticker = fav['ticker']
                     # Look up pre-fetched data
                     df = batch_data.get(ticker, pd.DataFrame())
@@ -205,7 +237,17 @@ def main():
                     
                     with f_cols[idx % 4]:
                         with st.container():
-                            st.markdown(f"**{ticker}**")
+                            # Strategy Badge
+                            rec = fav.get("strategy_rec", "Unknown")
+                            rec_html = ""
+                            if rec == "BUY":
+                                rec_html = " <span style='background-color:green; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>BUY</span>"
+                            elif rec == "SELL":
+                                rec_html = " <span style='background-color:red; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>SELL</span>"
+                            else:
+                                rec_html = f" <span style='background-color:grey; color:white; padding:2px 6px; border-radius:4px; font-size:0.8em'>{rec}</span>"
+
+                            st.markdown(f"**{ticker}**{rec_html}", unsafe_allow_html=True)
                             
                             score = fav['pressure_score']
                             diff = fav['rising_diff']
@@ -253,7 +295,7 @@ def main():
             live_portfolios = [p for p in pm.list_portfolios() if p.status.value == PortfolioStatus.LIVE.value]
             
             if not live_portfolios:
-                st.info("No active portfolios found. Create one in 'Portfolio & Robo-Advisor'.")
+                st.info("No active portfolios found. Create one in 'Portfolio Management'.")
             else:
                 from src.data.ingestion import DataFetcher
                 from src.analytics.risk import calculate_risk_metrics
@@ -346,8 +388,10 @@ def main():
         render_stock_view()
     elif page == "Risk Dashboard":
         render_risk_view()
-    elif page == "Portfolio & Robo-Advisor":
+    elif page == "Portfolio Management":
         render_portfolio_view()
+    elif page == "Robo Advisor":
+        render_robo_view()
     elif page == "Universe Management":
         render_universe_view()
 

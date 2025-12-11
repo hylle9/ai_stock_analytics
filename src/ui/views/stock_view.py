@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from src.data.ingestion import DataFetcher
 from src.analytics.technical import add_technical_features
 from src.utils.profiling import Timer
+from src.analytics.backtester import run_sma_strategy
 from src.analytics.metrics import calculate_returns, calculate_volatility, calculate_relative_volume, calculate_volume_acceleration
 
 from src.models.forecasting import ForecastModel
@@ -46,7 +47,8 @@ def load_dashboard_data_v2(ticker: str):
         "ai_insight": None,
         "deep_insight_weekly": None,
         "profile_error": None,
-        "metrics": {}
+        "metrics": {},
+        "sim_results": {} # Added for backtest simulation results
     }
 
     # 1. Fetch OHLCV (Max)
@@ -55,6 +57,8 @@ def load_dashboard_data_v2(ticker: str):
     if df_analysis.empty:
         return data # Invalid
         
+    data["valid"] = True
+    
     data["valid"] = True
     
     # 2. Fire-and-forget profile
@@ -69,12 +73,11 @@ def load_dashboard_data_v2(ticker: str):
     # 3. Technicals (on Max)
     # Re-use existing cached tech function or call directly
     # Since we are inside a cached function, calling another cached function is fine but maybe redundant.
-    # Let's call direct to save overhead or use the utility.
+    # Let's call direct to save overhead    # 3. Technicals (on Max)
     with Timer(f"TechFeatures:Main:{ticker}"):
         df_analysis = add_technical_features(df_analysis)
-    data["df_analysis"] = df_analysis
-
-    # 4. Benchmark (Max)
+        
+    # 4. Benchmark (Max) - Moved UP for Backtester dependency
     bench_df = fetcher.fetch_ohlcv("RSP", period="max")
     if not bench_df.empty:
         with Timer("TechFeatures:Bench"):
@@ -83,6 +86,14 @@ def load_dashboard_data_v2(ticker: str):
         start_date = df_analysis.index.min()
         bench_df = bench_df[bench_df.index >= start_date]
         data["bench_df"] = bench_df
+
+    # 5. Backtest Simulation (Runs on analysis df + benchmark)
+    # 5. Backtest Simulation (REMOVED - Moved to View for Filtering)
+    # This was previously running on Full History.
+    # We now run it in the View logic on 'chart_df'.
+    data["sim_results"] = {}
+        
+    data["df_analysis"] = df_analysis
 
     # 5. Alt Data & News
     with Timer(f"API:AltData:{ticker}"):
@@ -240,13 +251,13 @@ def load_dashboard_data_v2(ticker: str):
         # DEFERRED: Generation moved to render_stock_view
         data["technical_insight"] = cached_to_tech
 
-    # 10. Tracker Log (Side effect)
-    try:
-        with Timer(f"Tracker:LogView:{ticker}"):
-             tracker = ActivityTracker()
-             tracker.log_view(ticker, pressure_score)
-    except:
-         pass
+    # 10. Tracker Log (Side effect) -> MOVED TO MAIN VIEW to capture Rec
+    # try:
+    #     with Timer(f"Tracker:LogView:{ticker}"):
+    #          tracker = ActivityTracker()
+    #          tracker.log_view(ticker, pressure_score)
+    # except:
+    #      pass
 
     return data
 
@@ -478,6 +489,15 @@ def render_stock_view():
         
         # --- NEW: Consolidated Data Load ---
         # This blocks on first run, then is instant for 1 hour.
+        if st.sidebar.button("🔄 Force Refresh Data"):
+             st.toast("Clearing cache and refreshing...", icon="♻️")
+             # Manually init fetcher to trigger refresh
+             with st.spinner("Refetching data..."):
+                 f = DataFetcher()
+                 f.fetch_ohlcv(ticker, period="max", use_cache=False)
+                 st.cache_data.clear()
+                 st.rerun()
+
         # Fetch Dashboard Data
         with Timer(f"StockView:LoadData:{ticker}"):
              dashboard_data = load_dashboard_data_v2(ticker)
@@ -818,7 +838,7 @@ def render_stock_view():
                         bench_plot_df['sma_200'] = bench_plot_df['sma_200'] * ratio
             
             if start_200 > 0:
-                st.caption(f"ℹ️ The **S&P 500 Trend** line is visually scaled to start at {ticker}'s price (${start_200:.2f}) to make the growth comparison easy.")
+                st.info(f"ℹ️ **Note on Chart vs Metrics**: The Purple Line (S&P Market Trend) is **VISUALLY SCALED** to start at {ticker}'s price (${start_200:.2f}) so you can compare the *slopes*. The 'Buy & Hold' metrics below show the **REAL** Index Price (~$180+).")
 
             # Main Chart
             with Timer("StockView:PlotChart"):
@@ -829,10 +849,113 @@ def render_stock_view():
                 st.info(f"✨ **Last Golden Cross (SMA20 > SMA50)**: {last_cross_date.strftime('%Y-%m-%d')}")
             
             st.plotly_chart(fig, key=f"chart_{ticker}_{chart_period}")
+            
+            # --- RUN BACKTESTS ---
+            sim_bench_df = bench_plot_df 
+            
+            with Timer(f"Backtest:{ticker}:{chart_period}"):
+                 # 1. Short Term Trend (Standard)
+                 sim_results = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=False)
+                 # 2. Long Term Safety (Filtered)
+                 sim_safety = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=True)
+                 # 3. Strong but Safe (Filtered + Momentum)
+                 sim_strong = run_sma_strategy(chart_df, bench_df=sim_bench_df, investment_size=100000, trend_filter_sma200=True, min_trend_strength=0.15)
+
             with st.expander(f"Raw Data ({chart_period})"):
                 st.dataframe(chart_df.tail(10))
-        else:
-            st.error("No chart data available for this period.")
+            
+            # --- SIMULATION WIDGET ---
+            # Recommendation Logic (Safety Strategy)
+            rec_action = "BUY" if sim_safety.get("is_active") else "SELL"
+            rec_color = "green" if rec_action == "BUY" else "red"
+            
+            # Layout Header + Recommendation
+            sc1, sc2 = st.columns([3, 1])
+            with sc1:
+                st.markdown("### 🧬 Strategy Simulations")
+            with sc2:
+                # Custom aligned badge
+                st.markdown(
+                    f"""
+                    <div style="text-align: right; padding-top: 10px;">
+                        <span style="background-color: {rec_color}; color: white; padding: 4px 12px; border-radius: 4px; font-weight: bold;">
+                            Recommendation: {rec_action}
+                        </span>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+            
+            tab1, tab2, tab3 = st.tabs(["Short Term Trend Buys", "Long Term Safety", "Strong but Safe (>15% Alpha)"])
+            
+            def render_sim_metrics(sim, rule_desc):
+                if not sim or sim.get("trade_count", 0) == 0:
+                    st.info("No trades executed in this period.")
+                    return
+
+                sc1, sc2, sc3 = st.columns(3)
+                pnl = sim['total_pnl']
+                
+                # 1. Strategy PnL
+                with sc1:
+                    st.metric("Strategy PnL", f"${pnl:,.2f}", delta=None) 
+                    if pnl >= 0:
+                        st.success(f"{sim['trade_count']} Trades")
+                    else:
+                        st.error(f"{sim['trade_count']} Trades")
+                        
+                # 2. Buy & Hold (Stock)
+                bh_stock = sim.get('bh_stock_pnl', 0.0)
+                with sc2:
+                    diff = bh_stock - pnl 
+                    st.metric("Buy & Hold (Stock)", f"${bh_stock:,.2f}", delta=f"{diff:+.2f} vs Strat", delta_color="normal")
+                    s_buy = sim.get('bh_stock_buy', 0)
+                    s_sell = sim.get('bh_stock_sell', 0)
+                    st.caption(f"Buy: ${s_buy:.2f} ⮕ Sell: ${s_sell:.2f}")
+
+                # 3. Buy & Hold (S&P 500)
+                bh_bench = sim.get('bh_bench_pnl', 0.0)
+                with sc3:
+                    diff_bench = bh_bench - pnl
+                    st.metric("Buy & Hold (S&P 500 - RSP ETF)", f"${bh_bench:,.2f}", delta=f"{diff_bench:+.2f} vs Strat", delta_color="normal")
+                    b_buy = sim.get('bh_bench_buy', 0)
+                    b_sell = sim.get('bh_bench_sell', 0)
+                    st.caption(f"Buy: ${b_buy:.2f} ⮕ Sell: ${b_sell:.2f}")
+                
+                # Context Row
+                c_r1, c_r2 = st.columns([2, 1])
+                with c_r1:
+                     st.caption(f"**Rules:** {rule_desc}. Window: {sim['trades'][0]['buy_date'].strftime('%Y-%m-%d')} to {sim['trades'][-1]['sell_date'].strftime('%Y-%m-%d')}")
+                with c_r2:
+                     if sim.get('is_active'):
+                         st.warning("⚠️ Position Open")
+                     else:
+                         st.info("⚪ Position Closed")
+                
+                with st.expander("View Trade Log"):
+                    t_df = pd.DataFrame(sim['trades'])
+                    if not t_df.empty:
+                        st.dataframe(t_df, use_container_width=True)
+                st.divider()
+
+            with tab1:
+                render_sim_metrics(sim_results, "Buy \$100k @ Golden Cross, Sell All @ Death Cross")
+                
+            with tab2:
+                render_sim_metrics(sim_safety, "Buy $100k @ Golden Cross (IF SMA200 Rising), Sell All @ Death Cross")
+                
+            with tab3:
+                render_sim_metrics(sim_strong, "Buy $100k @ Golden Cross (IF SMA200 Rising AND SMA50 > SMA200 + 15%), Sell All @ Death Cross")
+        # 10. Log View (Moved here to capture Recommendation)
+        if "pressure_score" in dashboard_data:
+            strong_rec_action = "YES" if sim_strong.get("is_active") else "NO"
+            try:
+                # Instantiate tracker locally
+                t_tracker = ActivityTracker()
+                t_tracker.log_view(ticker, dashboard_data["pressure_score"], recommendation=rec_action, strong_rec=strong_rec_action)
+            except Exception as e:
+                # Fail silently in production
+                pass
             
             # --- News Feed (Moved here for context) ---
             # Keeping News below charts or with Multi-Modal?
@@ -848,6 +971,7 @@ def render_stock_view():
             st.markdown("---")
             st.subheader(f"Latest News Headlines ({len(news)})")
             st.caption("Expanded coverage for AI contexts.")
+           
             
             with st.container(height=400):
                 for item in news:
@@ -909,16 +1033,55 @@ def render_stock_view():
     rm = RelationshipManager()
     info = rm.get_info(ticker) if ticker else None
     
+    # Init data fetcher for details
+    # Reuse existing fetcher or create new instance (DataFetcher is already imported globally)
+    t_fetcher = DataFetcher()
+    t_tracker = ActivityTracker()
+
     def render_opp_card(symbol, reason, key_suffix):
+        # Fetch details (cached)
+        try:
+            profile = t_fetcher.get_company_profile(symbol)
+        except: profile = {}
+        
+        # Fetch Rec
+        rec_state = t_tracker.get_ticker_state(symbol)
+        rec = rec_state.get("strategy_rec")
+        rec_val = "N/A"
+        rec_color = "gray"
+        
+        if rec == "BUY":
+            rec_val = "BUY"
+            rec_color = "green"
+        elif rec == "SELL":
+            rec_val = "SELL"
+            rec_color = "red"
+        
+        name = profile.get('name') or rm.database.get(symbol, {}).get("name", symbol)
+        industry = profile.get('industry') or rm.database.get(symbol, {}).get("industry", "Unknown")
+        sector = profile.get('sector') or rm.database.get(symbol, {}).get("sector", "Unknown")
+        desc = profile.get('summary') or profile.get('description', "No description available.")
+        
+        # Truncate description for "Products/Services"
+        short_desc = (desc[:150] + '...') if len(desc) > 150 else desc
+
         with st.container():
-            col_r1, col_r2, col_r3 = st.columns([2, 2, 1])
-            with col_r1:
+            # Layout: Ticker | Name | Industry | Products/Desc | Rec | Action
+            c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 2, 3, 1, 1])
+            with c1:
                 st.markdown(f"**{symbol}**")
-                nm = rm.database.get(symbol, {}).get("name", symbol)
-                st.caption(nm)
-            with col_r2:
-                st.caption(reason)
-            with col_r3:
+            with c2:
+                st.caption(name)
+            with c3:
+                st.caption(f"**{sector}**\n\n{industry}")
+            with c4:
+                st.caption(short_desc)
+            with c5:
+                if rec_val == "N/A":
+                    st.caption("N/A")
+                else: 
+                     st.markdown(f":{rec_color}[**{rec_val}**]")
+            with c6:
                 if st.button("🔍", key=f"analyze_opp_{symbol}_{key_suffix}", help=f"Analyze {symbol}"):
                     st.session_state.analysis_ticker = symbol
                     st.rerun()
@@ -926,6 +1089,16 @@ def render_stock_view():
 
     if info:
         t_peers, t_comps = st.tabs(["Industry Peers", "Direct Competitors"])
+        
+        # Headers
+        header_cols = st.columns([1, 2, 2, 3, 1, 1])
+        header_cols[0].markdown("**Ticker**")
+        header_cols[1].markdown("**Company**")
+        header_cols[2].markdown("**Industry/Sector**")
+        header_cols[3].markdown("**Products/Services**")
+        header_cols[4].markdown("**Rec**")
+        header_cols[5].markdown("**Act**")
+        st.divider()
         
         with t_peers:
             peers = rm.get_industry_peers(ticker)

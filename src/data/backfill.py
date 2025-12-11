@@ -15,7 +15,10 @@ from src.data.ingestion import DataFetcher
 from src.analytics.activity import ActivityTracker
 from src.analytics.fusion import FusionEngine
 from src.analytics.technical import add_technical_features
+from src.analytics.backtester import run_sma_strategy
 from src.analytics.metrics import calculate_relative_volume, calculate_volume_acceleration, calculate_volatility
+from src.data.relationships import RelationshipManager
+from src.models.portfolio import PortfolioManager
 
 def main():
     print("🚀 Starting Historical Score Backfill...")
@@ -33,14 +36,45 @@ def main():
     for item in liked:
         targets.add(item['ticker'])
         
+    # Portfolio Holdings
+    pm = PortfolioManager()
+    portfolios = pm.list_portfolios()
+    for p in portfolios:
+        for t in p.holdings.keys():
+            targets.add(t)
+            
     # Rising (Recent Views)
     rising = tracker.get_rising_pressure_stocks(limit=20)
     print(f"📈 Found {len(rising)} recent rising stocks.")
     for item in rising:
         targets.add(item['ticker'])
         
-    target_list = sorted(list(targets))
-    print(f"📋 Total Targets to Refresh: {len(target_list)}")
+    # --- UNIVERSE EXPANSION ---
+    print("\n🌍 Expanding Universe via AI Graph...")
+    rm = RelationshipManager()
+    seeds = list(targets)
+    expanded_targets = set(targets)
+    
+    for seed in seeds:
+        # Get Competitors (Direct)
+        comps = rm.get_competitors(seed)
+        for c in comps:
+            formatted_c = c.upper().strip()
+            if formatted_c and formatted_c not in expanded_targets:
+                expanded_targets.add(formatted_c)
+        
+        # Get Peers (Industry) - Limit 5
+        peers = rm.get_industry_peers(seed, limit=5)
+        for p in peers:
+             formatted_p = p.upper().strip()
+             if formatted_p and formatted_p not in expanded_targets:
+                 expanded_targets.add(formatted_p)
+
+    target_list = sorted(list(expanded_targets))
+    # Filter pollution
+    target_list = [t for t in target_list if not t.startswith("SYN")]
+    
+    print(f"📋 Total Targets to Refresh: {len(target_list)} (Expanded from {len(seeds)})")
     
     if not target_list:
         print("Done.")
@@ -58,6 +92,12 @@ def main():
         try:
             # A. Fetch Data (Force 1y to ensure depth)
             df = fetcher.fetch_ohlcv(ticker, period="1y")
+
+            # A.2. Pre-warn Profile (Description/Industry)
+            try:
+                fetcher.get_company_profile(ticker)
+            except: pass
+
             if df.empty or len(df) < 50:
                 print(f"   ⚠️ Insufficient Data (Rows: {len(df)})")
                 continue
@@ -107,12 +147,33 @@ def main():
                 volume_acceleration=vol_acc
             )
             
-            print(f"   ✅ Score: {score:.1f} (VolAcc: {vol_acc:.1%}, RelVol: {rel_vol:.1f})")
+            # Strategy Rec
+            sim_res = run_sma_strategy(df, trend_filter_sma200=True)
+            strategy_rec = "BUY" if sim_res.get("is_active") else "SELL"
+            
+            # Strong Rec
+            sim_strong = run_sma_strategy(df, trend_filter_sma200=True, min_trend_strength=0.15)
+            strong_rec = "YES" if sim_strong.get("is_active") else "NO"
+            
+            print(f"   ✅ Score: {score:.1f} | Rec: {strategy_rec} (VolAcc: {vol_acc:.1%})")
             
             # F. Update DB
-            tracker.update_ticker_metadata(ticker, {"score": score, "last_updated": datetime.now().isoformat()})
+            meta = {
+                "score": score, 
+                "last_updated": datetime.now().isoformat(),
+                "strategy_rec": strategy_rec,
+                "strong_rec": strong_rec
+            }
+            tracker.update_ticker_metadata(ticker, meta)
             collected_scores[ticker] = score
             success_count += 1
+            
+            # Pre-warm Profile Data (for UI descriptions)
+            try: 
+                fetcher.get_company_profile(ticker)
+            except Exception as e_prof:
+                 # Non-critical
+                 pass
             
         except Exception as e:
             print(f"   ❌ Error: {e}")

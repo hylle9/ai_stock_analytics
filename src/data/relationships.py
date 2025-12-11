@@ -173,6 +173,11 @@ class RelationshipManager:
                 """
                 peers = con.execute(peers_query, (ind, ticker, limit)).fetchall()
                 peer_list = [x[0] for x in peers]
+                
+                # Filter out SYN tickers in Production
+                if Config.DATA_STRATEGY == "PRODUCTION":
+                    peer_list = [p for p in peer_list if not p.startswith("SYN")]
+                
                 # Auto-Expand if empty
                 # TRACE: Finding the hang
                 if len(peer_list) < 3 and Config.GOOGLE_API_KEY:

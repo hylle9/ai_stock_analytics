@@ -18,6 +18,8 @@ from src.models.portfolio import PortfolioManager
 import db_dtypes # ensure pandas legacy support for duckdb
 import json
 from src.analytics.metrics import calculate_relative_volume, calculate_volume_acceleration
+from src.analytics.technical import add_technical_features
+from src.analytics.backtester import run_sma_strategy
 
 # --- CONFIGURATION ---
 LOG_FILE = os.path.join(Config.DATA_CACHE_DIR, "dcs_event.log")
@@ -114,6 +116,10 @@ def main():
             
         # Convert to sorted list for consistent execution
         target_list = sorted(list(update_targets))
+        
+        # Polluted DB Guard: Filter out "SYN" tickers
+        target_list = [t for t in target_list if not t.startswith("SYN")]
+        
         pressure_scores = []
         
         if not target_list:
@@ -165,14 +171,29 @@ def main():
                         if not df.empty:
                             print(f"   ✅ OHLCV Updated ({len(df)} rows)")
                             
-                            # Simple RSI calc
-                            delta = df['close'].diff()
-                            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                            rs = gain / loss
-                            rsi_series = 100 - (100 / (1 + rs))
-                            if not rsi_series.empty:
-                                current_rsi = rsi_series.iloc[-1]
+                            
+                            # --- CALCULATE STRATEGY REC ---
+                            try:
+                                # Need features for backtester
+                                tech_df = add_technical_features(df.copy())
+                                
+                                # Extract RSI from Technicals (Standardized)
+                                if 'rsi' in tech_df.columns and not tech_df['rsi'].empty:
+                                    last_rsi = tech_df['rsi'].iloc[-1]
+                                    if not pd.isna(last_rsi):
+                                        current_rsi = last_rsi
+                                
+                                # Run Long Term Safety
+                                # Run Long Term Safety
+                                sim_res = run_sma_strategy(tech_df, trend_filter_sma200=True)
+                                strategy_rec = "BUY" if sim_res.get("is_active") else "SELL"
+                                
+                                # Run Strong but Safe (>15% Alpha)
+                                sim_strong = run_sma_strategy(tech_df, trend_filter_sma200=True, min_trend_strength=0.15)
+                                strong_rec = "YES" if sim_strong.get("is_active") else "NO"
+                            except Exception as ex_strat:
+                                print(f"   ⚠️ Strategy SIm Error: {ex_strat}")
+                                strategy_rec = "Unknown"
                         else:
                             log_event(ticker, "OHLCV", "FAIL", "Empty DataFrame", origin)
                 except Exception as e:
@@ -228,9 +249,23 @@ def main():
                         volume_acceleration=vol_acc
                     )
                     pressure_scores.append(score)
-                    tracker.update_ticker_metadata(ticker, {"score": score, "last_updated": datetime.now().isoformat()})
+                    
+                    # Store Metadata (Including new Strategy Rec)
+                    meta_payload = {
+                        "score": score, 
+                        "last_updated": datetime.now().isoformat(),
+                        "strategy_rec": strategy_rec if 'strategy_rec' in locals() else "Unknown",
+                        "strong_rec": strong_rec if 'strong_rec' in locals() else "NO"
+                    }
+                    tracker.update_ticker_metadata(ticker, meta_payload)
                 except Exception as e:
                     print(f"   ❌ Fusion Error: {e}")
+
+                # Pre-warm Profile Data (for UI descriptions)
+                try: 
+                    fetcher.get_company_profile(ticker)
+                except Exception as e_prof:
+                     pass
 
                 # --- F. GEMINI RESEARCH ---
                 try:
